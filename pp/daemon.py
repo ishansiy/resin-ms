@@ -71,7 +71,10 @@ def http(url, method="GET", body=None, headers=None, timeout=30):
 
 
 def api(path, method="GET", body=None):
-    return http(f"{LOCAL_API}{path}", method, body, {"X-Resin-Token": ADMIN}, 30)
+    # 直连 127.0.0.1:2260 时应用只认 Authorization；
+    # 走 nginx(7860) 时认 X-Resin-Token。两个都带，任一路径都通。
+    return http(f"{LOCAL_API}{path}", method, body,
+                {"X-Resin-Token": ADMIN, "Authorization": f"Bearer {ADMIN}"}, 30)
 
 
 # ---------------- 采集 ----------------
