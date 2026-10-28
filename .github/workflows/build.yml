@@ -63,11 +63,14 @@ jobs:
         run: |
           set -euo pipefail
           V='${{ steps.up.outputs.version }}'
-          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository_owner }}/resin-ms:pull&service=ghcr.io" | jq -r .token)
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
-            "https://ghcr.io/v2/${{ github.repository_owner }}/resin-ms/manifests/${V}")
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository_owner }}/resin-ms:pull&service=ghcr.io" 2>/dev/null | jq -r '.token // empty' || true)
+          CODE=000
+          if [ -n "${TOKEN:-}" ]; then
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${{ github.repository_owner }}/resin-ms/manifests/${V}")
+          fi
           echo "上游版本 ${V} 对应镜像 manifest HTTP=${CODE}"
           NEED=false
           if [ "$CODE" != "200" ]; then NEED=true; echo "→ 该版本镜像不存在，需要构建"; fi
