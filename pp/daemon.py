@@ -15,6 +15,7 @@
 
 只用标准库；任何异常都不影响主服务（失败只记日志，下个周期重试）。
 """
+import ipaddress
 import json
 import os
 import re
@@ -69,6 +70,24 @@ COUNTRY_ZH = {
     "za": "南非", "zm": "赞比亚", "zw": "津巴布韦",
 }
 TIER_ZH = {"RESI": "住宅IP", "PURE": "纯净", "GOOD": "良好", "RISKY": "高风险"}
+CDN_PLATFORM = "CDN出口"
+# Anycast/CDN 出口网段兜底（探测还没跑到时也能识别，防止漏进国家平台）
+CDN_NETS = [
+    "104.16.0.0/13", "104.24.0.0/14", "104.28.0.0/16", "108.162.192.0/18",
+    "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15", "172.64.0.0/13",
+    "173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22",
+    "198.41.128.0/17",  # Cloudflare
+    "151.101.0.0/16",   # Fastly
+]
+# 出口落在 Anycast/CDN 网段的 ASN：这类"国家"是边缘机房位置，不是真实落地，不进国家平台
+CDN_ASNS = {
+    13335,   # Cloudflare
+    54113,   # Fastly
+    20940,   # Akamai
+    16625,   # Akamai
+    60068,   # CDN77
+    19551,   # Incapsula
+}
 
 
 def log(msg):
@@ -308,34 +327,62 @@ def cleanup_stale(existing, desired_names, manifest):
     return removed
 
 
+_CDN_NETWORKS = None
+
+
+def is_cdn_ip(ip):
+    """出口 IP 是否落在已知 CDN/Anycast 网段（探测未覆盖时兜底）。"""
+    global _CDN_NETWORKS
+    if not ip:
+        return False
+    if _CDN_NETWORKS is None:
+        _CDN_NETWORKS = [ipaddress.ip_network(n) for n in CDN_NETS]
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _CDN_NETWORKS)
+
+
 def regroup(nodes, cache):
     """按国家 + 纯净度把节点分到平台（平台名用中文）。返回平台变更数。"""
     existing = existing_platforms()
     by_country = {}
     by_tier = {}
+    by_cdn = []
     for n in nodes:
         tag = node_tag(n)
         if not tag:
             continue
-        region = (n.get("region") or "").lower()
-        if region and region.isalpha() and len(region) == 2:
-            by_country.setdefault(region, []).append(tag)
         rec = cache.get(n.get("egress_ip") or "")
         tier = tier_of(rec)
         if tier:
             by_tier.setdefault(tier, []).append(tag)
+        # CDN/Anycast 出口：geo 报的是边缘机房，不能当真实国家用 → 单独收容
+        if (rec and rec.get("asn") in CDN_ASNS) or is_cdn_ip(n.get("egress_ip")):
+            by_cdn.append(tag)
+            continue
+        # 国家以「实测出口国家」为准（探测过就用实测，没探测过退回 Resin 的 region 猜测）
+        cc = ((rec or {}).get("cc") or "").lower() or (n.get("region") or "").lower()
+        if cc and cc.isalpha() and len(cc) == 2:
+            by_country.setdefault(cc, []).append(tag)
 
     desired = {}
     # 国家平台：靠 region_filters，天然跟随节点增减；名字显示中文
     for cc, tags in sorted(by_country.items()):
         name = COUNTRY_ZH.get(cc, cc.upper())
-        desired[name] = {
+        tags = sorted(set(tags))
+        payload = {
             "name": name,
             "region_filters": [cc],
             "allocation_policy": "BALANCED",
             "reverse_proxy_miss_action": "TREAT_AS_EMPTY",
-            "_desc": f"{cc.upper()} {len(tags)} 节点",
+            "_desc": f"{cc.upper()} {len(tags)} 节点（实测出口）",
         }
+        # region 只是粗筛（CF 等 CDN 出口会被 geo 判成边缘机房所在地），再用精确 tag 收敛
+        if len(tags) <= 800:
+            payload["regex_filters"] = [f"^{re.escape(t)}$" for t in tags]
+        desired[name] = payload
 
     # 纯净度平台：靠 tag 精确匹配（Resin 只能按 tag/region 过滤）
     labels = {"RESI": "原生/住宅 IP", "PURE": f"风险系数<={TIER_PURE_MAX}",
@@ -353,6 +400,16 @@ def regroup(nodes, cache):
             "allocation_policy": "BALANCED",
             "reverse_proxy_miss_action": "TREAT_AS_EMPTY",
             "_desc": f"{labels[tier]}，{len(tags)} 节点",
+        }
+
+    cdn_tags = sorted(set(by_cdn))
+    if cdn_tags:
+        desired[CDN_PLATFORM] = {
+            "name": CDN_PLATFORM,
+            "regex_filters": [f"^{re.escape(t)}$" for t in cdn_tags],
+            "allocation_policy": "BALANCED",
+            "reverse_proxy_miss_action": "TREAT_AS_EMPTY",
+            "_desc": f"CDN/Anycast 出口，{len(cdn_tags)} 节点",
         }
 
     made = 0
