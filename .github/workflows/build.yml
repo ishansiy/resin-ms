@@ -1,0 +1,179 @@
+name: build-resin-ms
+
+# 上游 Resinat/Resin 官方 Dockerfile 编译 → 叠加 nginx 单端口层 → 推公开 GHCR
+# → 调用魔塔创空间 deploy 重新部署（创空间 Dockerfile 只引用 :latest）
+#
+# 每日 03:17 CST 自动检查上游最新 release tag；已构建过则跳过，新版本则重建并重新部署。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重建（即使该版本镜像已存在）'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.overlay'
+      - 'nginx.conf'
+      - 'start.sh'
+      - 'landing.html'
+      - '.github/workflows/build.yml'
+  schedule:
+    - cron: '17 19 * * *'   # UTC 19:17 = 次日 03:17 CST
+
+concurrency:
+  group: build-resin-ms
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/resin-ms
+  UPSTREAM: Resinat/Resin
+
+jobs:
+  check:
+    name: 检查上游版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.up.outputs.version }}
+      need: ${{ steps.decide.outputs.need }}
+    steps:
+      - name: 取上游最新 release tag
+        id: up
+        run: |
+          set -euo pipefail
+          V=$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}.git" 'v*' \
+              | awk -F/ '{print $NF}' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+          [ -n "$V" ] || { echo "无法读取上游 tag" >&2; exit 1; }
+          echo "上游最新版本: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 判断是否需要构建
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          V='${{ steps.up.outputs.version }}'
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository_owner }}/resin-ms:pull&service=ghcr.io" | jq -r .token)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${{ github.repository_owner }}/resin-ms/manifests/${V}")
+          echo "上游版本 ${V} 对应镜像 manifest HTTP=${CODE}"
+          NEED=false
+          if [ "$CODE" != "200" ]; then NEED=true; echo "→ 该版本镜像不存在，需要构建"; fi
+          if [ "$EVENT" = "push" ]; then NEED=true; echo "→ 本仓文件变更，强制构建"; fi
+          if [ "$FORCE" = "true" ]; then NEED=true; echo "→ 手动指定强制构建"; fi
+          if [ "$NEED" = "false" ]; then echo "→ 已是最新镜像，跳过构建"; fi
+          echo "need=$NEED" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 构建并推送镜像
+    needs: check
+    if: needs.check.outputs.need == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取上游源码（指定 tag）
+        run: git clone --depth 1 --branch '${{ needs.check.outputs.version }}' "https://github.com/${UPSTREAM}.git" upstream
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 编译上游应用镜像（保留可回退的纯净标签）
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          push: true
+          build-args: |
+            VERSION=${{ needs.check.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_id }}
+          tags: |
+            ${{ env.IMAGE }}:app-${{ needs.check.outputs.version }}
+            ${{ env.IMAGE }}:app-latest
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=max,scope=app
+
+      - name: 叠加 nginx 单端口层
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.overlay
+          push: true
+          build-args: |
+            BASE=${{ env.IMAGE }}:app-${{ needs.check.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.check.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=overlay
+          cache-to: type=gha,mode=max,scope=overlay
+
+      # 包可见性：GITHUB_TOKEN 通常无权改，失败不阻塞（首次已由 owner PAT 设为公开）
+      - name: 尝试把包设为 public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PATCH "/user/packages/container/resin-ms" -f visibility=public
+
+  deploy:
+    name: 魔塔创空间重新部署
+    needs: [check, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 触发 deploy 并等待 Running
+        env:
+          MS_TOKEN: ${{ secrets.MS_TOKEN }}
+          MS_STUDIO: ${{ vars.MS_STUDIO }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MS_TOKEN:-}" ]; then
+            echo "::warning::MS_TOKEN secret 未配置，跳过魔塔自动重新部署（镜像已构建完成）"
+            exit 0
+          fi
+          STUDIO="${MS_STUDIO:-hansiy/resin-ms}"
+          echo "重新部署魔塔创空间 ${STUDIO}（镜像版本 ${VERSION}）"
+          CODE=$(curl -sS -o /tmp/deploy.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${MS_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data '{}' \
+            "https://www.modelscope.ai/openapi/v1/studios/${STUDIO}/deploy")
+          echo "deploy HTTP=${CODE}"; head -c 400 /tmp/deploy.json; echo
+          [ "$CODE" = "200" ] || { echo "::error::deploy 调用失败"; exit 1; }
+
+          for i in $(seq 1 40); do
+            sleep 20
+            curl -sS -H "Authorization: Bearer ${MS_TOKEN}" \
+              "https://www.modelscope.ai/openapi/v1/studios/${STUDIO}" -o /tmp/studio.json || true
+            STATUS=$(jq -r '(.data.status // .status // "unknown")' /tmp/studio.json 2>/dev/null || echo unknown)
+            echo "[$i] status=${STATUS}"
+            case "$STATUS" in
+              Running) echo "::notice::创空间已运行 ${VERSION}"; exit 0 ;;
+              DeployFailed|BuildFailed|Failed)
+                echo "::error::部署失败 status=${STATUS}"
+                jq -r '(.data.runtime.error_message // .data.error_message // empty)' /tmp/studio.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          echo "::warning::等待超时（约 13 分钟仍未 Running），请到魔塔控制台确认"

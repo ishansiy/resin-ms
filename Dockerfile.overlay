@@ -1,0 +1,30 @@
+# 叠加层：在官方 Resin 镜像上加 nginx，把「面板 + API + 反代入口 + 多 Endpoint 端口」
+# 统一收敛到一个对外端口 7860（魔塔创空间只暴露这一个端口）。
+ARG BASE=ghcr.io/ishansiy/resin-ms:app-latest
+FROM ${BASE}
+
+USER root
+
+RUN apk add --no-cache nginx sqlite tzdata curl \
+ && mkdir -p /run/nginx /etc/resin /usr/share/resin \
+            /var/lib/nginx/tmp /var/lib/nginx/client_body /var/lib/nginx/proxy \
+            /var/lib/nginx/fastcgi /var/lib/nginx/scgi /var/lib/nginx/uwsgi \
+ && rm -f /etc/nginx/http.d/*.conf
+
+COPY nginx.conf /etc/resin/nginx.conf
+COPY landing.html /usr/share/resin/index.html
+COPY start.sh /usr/local/bin/resin-start.sh
+RUN chmod +x /usr/local/bin/resin-start.sh
+
+# Resin 只监听回环地址，公网一律经 nginx:7860
+ENV RESIN_LISTEN_ADDRESS=127.0.0.1 \
+    RESIN_PORT=2260 \
+    RESIN_LOCAL_DIR=/data \
+    RESIN_PERSIST_DIR=/mnt/workspace/resin-data \
+    TZ=Asia/Shanghai
+
+EXPOSE 7860
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:7860/healthz >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/resin-start.sh"]
