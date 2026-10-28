@@ -157,11 +157,9 @@ def collect(cache, targets):
 # ---------------- 分组 ----------------
 
 def node_tag(node):
-    """display_tag 形如 '<订阅名>/<节点名>'，取节点名交给正则匹配。"""
-    tag = (node.get("display_tag") or "").strip()
-    if "/" in tag:
-        tag = tag.split("/", 1)[1]
-    return tag.strip()
+    """Resin 的 tag 过滤匹配的是完整候选串 "<订阅名>/<节点名>"，
+    与 display_tag 完全一致，所以直接用整串，不能去掉前缀。"""
+    return (node.get("display_tag") or "").strip()
 
 
 def tier_of(rec):
