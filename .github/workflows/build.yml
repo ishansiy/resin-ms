@@ -19,6 +19,7 @@ on:
       - 'nginx.conf'
       - 'start.sh'
       - 'landing.html'
+      - 'pp/**'
       - '.github/workflows/build.yml'
   schedule:
     - cron: '17 19 * * *'   # UTC 19:17 = 次日 03:17 CST
