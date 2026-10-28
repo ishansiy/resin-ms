@@ -18,8 +18,12 @@
 ```
 
 - Resin 只监听 `127.0.0.1:2260`，公网请求一律经 nginx。
-- 活跃 SQLite（`state.db`）跑在容器本地盘，每 120s 用 `sqlite3 .backup` + `quick_check` 做一致性快照到
-  `/mnt/workspace/resin-data/`（OSSFS 上不直跑 SQLite），启动时自动恢复。
+- **状态库就放在创空间持久盘**：`/mnt/workspace/resin-data/state/state.db`，重建容器/重新部署后配置不丢。
+  持久盘是 OSSFS，SQLite 跑在 FUSE 上有页级损坏风险，所以启动时先 `PRAGMA quick_check` 自检，
+  不通过就依次回滚 `state.db.bak1/bak2/bak3`，全坏则隔离损坏文件并以空库启动；
+  运行中每 300s 做一次 `.backup` + `quick_check` 轮转（新备份校验不过就不覆盖旧备份）。
+  持久盘不可写时自动降级到容器本地盘（服务能起，只是重建后丢配置）。
+- 高写入的 `metrics.db` 与请求日志库留在容器本地盘（`/data`），避免持续写持久盘。
 - 管理令牌支持三种投递方式：`X-Resin-Token` 头、`resin_admin` cookie（浏览器访问 `/t/<令牌>` 自动写入）、
   原生 `Authorization: Bearer`。后两者用于绕过托管平台边缘对 `Authorization` 的改写。
 

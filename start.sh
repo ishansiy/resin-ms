@@ -1,20 +1,36 @@
 #!/bin/sh
-# Resin 单端口启动编排：本地盘跑活跃 SQLite + 定时一致性快照落持久盘 + nginx 统一 7860
+# Resin 单端口启动编排
+#   - 状态库 state.db 放持久盘 /mnt/workspace（重建容器不丢配置）
+#   - 持久盘是 OSSFS，SQLite 在 FUSE 上有页级损坏风险 → 启动自检 + 备份轮转 + 自动回滚
+#   - 高写入的 metrics / 请求日志库留在容器本地盘，避免拖垮持久盘
+#   - nginx 统一对外 7860
 set -eu
 
 DATA_DIR="${RESIN_LOCAL_DIR:-/data}"
 PERSIST_DIR="${RESIN_PERSIST_DIR:-/mnt/workspace/resin-data}"
-STATE_DIR="$DATA_DIR/state"
 CACHE_DIR="$DATA_DIR/cache"
 LOG_DIR="$DATA_DIR/log"
 CRED_FILE="$PERSIST_DIR/credentials.env"
-SNAP_DB="$PERSIST_DIR/state.db"
-SNAP_PREV="$PERSIST_DIR/state.db.prev"
-SNAP_INTERVAL="${RESIN_SNAPSHOT_INTERVAL:-120}"
+ROTATE_INTERVAL="${RESIN_ROTATE_INTERVAL:-300}"
 
 log() { printf '[resin-start %s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
-mkdir -p "$STATE_DIR" "$CACHE_DIR" "$LOG_DIR" "$PERSIST_DIR"
+mkdir -p "$CACHE_DIR" "$LOG_DIR" "$PERSIST_DIR"
+
+# ---------- 持久盘可用性探测：不可写就降级到本地盘，保证服务能起来 ----------
+PERSIST_OK=0
+if mkdir -p "$PERSIST_DIR/state" 2>/dev/null && : > "$PERSIST_DIR/.write_test" 2>/dev/null; then
+  PERSIST_OK=1
+  rm -f "$PERSIST_DIR/.write_test"
+fi
+if [ "$PERSIST_OK" = "1" ]; then
+  STATE_DIR="$PERSIST_DIR/state"
+  log "状态库目录 = $STATE_DIR（持久盘 /mnt/workspace，重建容器不丢配置）"
+else
+  STATE_DIR="$DATA_DIR/state"
+  mkdir -p "$STATE_DIR"
+  log "警告：持久盘 $PERSIST_DIR 不可写，状态库降级到本地盘 $STATE_DIR（重建后会丢配置）"
+fi
 
 # ---------- 凭据：平台 Secret 优先；否则复用持久盘上已生成的；再否则随机生成 ----------
 read_cred() { sed -n "s/^$1=//p" "$CRED_FILE" 2>/dev/null | head -n1; }
@@ -32,40 +48,65 @@ if [ -z "${RESIN_PROXY_TOKEN:-}" ]; then
   GEN_PROXY=1
 fi
 if [ -n "$GEN_ADMIN$GEN_PROXY" ]; then
-  umask 077
-  {
-    echo "RESIN_ADMIN_TOKEN=$RESIN_ADMIN_TOKEN"
-    echo "RESIN_PROXY_TOKEN=$RESIN_PROXY_TOKEN"
-  } > "$CRED_FILE.tmp"
-  mv "$CRED_FILE.tmp" "$CRED_FILE"
-  umask 022
-  log "未通过平台 Secret 提供令牌，已随机生成并写入 $CRED_FILE"
+  if ( umask 077; printf 'RESIN_ADMIN_TOKEN=%s\nRESIN_PROXY_TOKEN=%s\n' \
+        "$RESIN_ADMIN_TOKEN" "$RESIN_PROXY_TOKEN" > "$CRED_FILE.tmp" ) 2>/dev/null \
+     && mv "$CRED_FILE.tmp" "$CRED_FILE"; then
+    log "未提供平台 Secret，已随机生成令牌并写入 $CRED_FILE"
+  else
+    rm -f "$CRED_FILE.tmp" 2>/dev/null || true
+    log "未提供平台 Secret，已随机生成令牌（持久盘不可写，仅本次有效）"
+  fi
   log "管理令牌(AdminToken): $RESIN_ADMIN_TOKEN"
   log "代理令牌(ProxyToken): $RESIN_PROXY_TOKEN"
 fi
 export RESIN_ADMIN_TOKEN RESIN_PROXY_TOKEN
 
-# ---------- 状态库：活跃库放本地盘，启动时从持久盘快照恢复 ----------
-if [ ! -s "$STATE_DIR/state.db" ] && [ -s "$SNAP_DB" ]; then
-  if cp "$SNAP_DB" "$STATE_DIR/state.db"; then
-    log "已从持久盘恢复 state.db（$(wc -c < "$STATE_DIR/state.db" 2>/dev/null || echo '?') 字节）"
+# ---------- 状态库完整性：SQLite 跑在 OSSFS 上，先自检再决定用哪个文件 ----------
+DB="$STATE_DIR/state.db"
+
+db_ok() {
+  [ -s "$1" ] || return 1
+  [ "$(sqlite3 "$1" 'PRAGMA quick_check;' 2>/dev/null)" = "ok" ]
+}
+
+if [ -s "$DB" ]; then
+  if db_ok "$DB"; then
+    log "state.db 完整性检查通过（$(wc -c < "$DB") 字节）"
+  else
+    log "警告：state.db 完整性检查未通过，尝试回滚到最近可用备份"
+    for f in state.db.bak1 state.db.bak2 state.db.bak3; do
+      if db_ok "$STATE_DIR/$f"; then
+        cp "$STATE_DIR/$f" "$DB" && log "已回滚到 $f"
+        break
+      fi
+    done
+    if ! db_ok "$DB"; then
+      mv "$DB" "$STATE_DIR/state.db.corrupt.$(date +%s)" 2>/dev/null || rm -f "$DB"
+      log "所有备份均不可用：已隔离损坏库，将以空库启动（损坏文件保留在 $STATE_DIR）"
+    fi
   fi
+else
+  log "未发现 state.db，将初始化新库"
 fi
 
-snapshot() {
-  [ -s "$STATE_DIR/state.db" ] || return 0
-  tmp="$DATA_DIR/.state.snap.$$"
-  if ! sqlite3 "$STATE_DIR/state.db" ".backup '$tmp'" >/dev/null 2>&1; then
+# ---------- 备份轮转：只在 quick_check 通过时才替换备份，避免用坏库覆盖好备份 ----------
+rotate() {
+  [ -s "$DB" ] || return 0
+  tmp="$DATA_DIR/.state.rot.$$"
+  if ! sqlite3 "$DB" ".backup '$tmp'" >/dev/null 2>&1; then
     rm -f "$tmp"
+    log "备份失败（库忙或不可读），本轮跳过"
     return 0
   fi
   if [ "$(sqlite3 "$tmp" 'PRAGMA quick_check;' 2>/dev/null)" = "ok" ]; then
-    [ -s "$SNAP_DB" ] && cp "$SNAP_DB" "$SNAP_PREV.tmp" 2>/dev/null && mv "$SNAP_PREV.tmp" "$SNAP_PREV" || true
-    cp "$tmp" "$SNAP_DB.tmp" && mv "$SNAP_DB.tmp" "$SNAP_DB" && log "state.db 快照已更新（$(wc -c < "$SNAP_DB") 字节）"
+    [ -s "$STATE_DIR/state.db.bak2" ] && mv "$STATE_DIR/state.db.bak2" "$STATE_DIR/state.db.bak3"
+    [ -s "$STATE_DIR/state.db.bak1" ] && mv "$STATE_DIR/state.db.bak1" "$STATE_DIR/state.db.bak2"
+    mv "$tmp" "$STATE_DIR/state.db.bak1"
+    log "state.db 备份轮转完成（bak1=$(wc -c < "$STATE_DIR/state.db.bak1") 字节）"
   else
-    log "警告：快照 quick_check 未通过，本次不覆盖持久盘"
+    rm -f "$tmp"
+    log "警告：新备份 quick_check 未通过，保留旧备份不动"
   fi
-  rm -f "$tmp"
 }
 
 # ---------- 启动 Resin（仅回环，公网走 nginx） ----------
@@ -77,11 +118,10 @@ export RESIN_STATE_DIR="$STATE_DIR" \
 
 chown -R resin:resin "$STATE_DIR" "$CACHE_DIR" "$LOG_DIR" 2>/dev/null || true
 
-log "启动 resin（监听 ${RESIN_LISTEN_ADDRESS}:${RESIN_PORT}，状态库 ${STATE_DIR}/state.db）"
+log "启动 resin（监听 ${RESIN_LISTEN_ADDRESS}:${RESIN_PORT}）"
 su-exec resin:resin /usr/local/bin/resin &
 RESIN_PID=$!
 
-# 等 resin 就绪（最多 60s），再起 nginx
 i=0
 while [ "$i" -lt 60 ]; do
   if curl -fsS "http://127.0.0.1:${RESIN_PORT}/healthz" >/dev/null 2>&1; then
@@ -95,15 +135,13 @@ done
 # ---------- 启动 nginx（对外 7860） ----------
 nginx -c /etc/resin/nginx.conf -g 'daemon off;' &
 NGX_PID=$!
-log "nginx 已启动，对外端口 7860 → 面板 /ui/ ，反代 /<令牌>/... ，额外端点 /e/1../e/5"
+log "nginx 已启动：对外 7860 → 面板 /ui/ ，API /api/ ，反代 /<令牌>/... ，额外端点 /e/1../e/5"
 
-# 后台定时快照
+# 后台备份轮转
 (
-  while sleep "$SNAP_INTERVAL"; do
-    snapshot
-  done
+  while sleep "$ROTATE_INTERVAL"; do rotate; done
 ) &
-SNAP_PID=$!
+ROT_PID=$!
 
 cleanup() {
   trap - TERM INT EXIT
@@ -111,8 +149,8 @@ cleanup() {
   kill -QUIT "$NGX_PID" 2>/dev/null || true
   kill -TERM "$RESIN_PID" 2>/dev/null || true
   wait "$RESIN_PID" 2>/dev/null || true
-  kill "$SNAP_PID" 2>/dev/null || true
-  snapshot
+  kill "$ROT_PID" 2>/dev/null || true
+  rotate
   exit 0
 }
 trap cleanup TERM INT
