@@ -75,6 +75,33 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
 
 用法示例：走日本节点 → `https://<域名>/<代理令牌>/日本/https/api.ipify.org?format=json`。
 
+### 上游请求头契约（重要）
+
+平台边缘（ms.fun / 阿里云 PAI-EAS 网关）会给发往容器的请求注入它自己的 `Authorization`，
+Resin 会原样转给目标站点。因此镜像内 nginx 在反代路径上**重建**该头：
+
+| 客户端发送 | 目标站点收到 |
+|---|---|
+| （不发） | 无 `Authorization` |
+| `X-Resin-Auth: Bearer sk-xxx` | `Authorization: Bearer sk-xxx`（逐字节一致） |
+| `Authorization: Bearer sk-xxx` | **被边缘覆盖，不可用**，请改用 `X-Resin-Auth` |
+| 其它头（`xi-api-key`、`Cookie`、自定义） | 原样透传 |
+
+```bash
+# ElevenLabs 这类"同时有 xi-api-key 和 Authorization 就拒绝"的 API
+curl -H "xi-api-key: $KEY" \
+  "https://<域名>/<代理令牌>/美国/https/api.elevenlabs.io/v1/voices"
+# 需要 Bearer 的 API
+curl -H "X-Resin-Auth: Bearer $TOKEN" \
+  "https://<域名>/<代理令牌>/美国/https/api.openai.com/v1/models"
+```
+
+`X-Resin-Auth` 会被 nginx 消费掉，不会传给目标站点。另外还剥掉了 `Original-Host`、
+`Wl-Proxy-Client-Ip`、`Eagleeye-*`、`X-Fc-*` 这些内部链路头。
+
+> `X-Resin-Account`（以及反代路径里的账号段）必须是 ASCII：中文会被 HTTP 头编码拒绝
+> （`'latin-1' codec can't encode`）。平台名可以是中文，账号名不行。
+
 ⚠️ 平台名是中文，反代路径里的平台段**必须做百分号编码**（NFKC 无关，纯 URL 编码）：
 
 ```bash
