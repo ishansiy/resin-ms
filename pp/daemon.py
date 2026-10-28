@@ -41,6 +41,35 @@ TIER_PURE_MAX = 20
 TIER_GOOD_MAX = 50
 PLATFORM_PREFIX = "PP-"
 
+# 平台名直接用中文（反代路径需对中文做百分号编码，已验证可用）
+COUNTRY_ZH = {
+    "ae": "阿联酋", "al": "阿尔巴尼亚", "am": "亚美尼亚", "ao": "安哥拉", "ar": "阿根廷",
+    "at": "奥地利", "au": "澳大利亚", "az": "阿塞拜疆", "ba": "波黑", "bd": "孟加拉",
+    "be": "比利时", "bg": "保加利亚", "bh": "巴林", "bn": "文莱", "bo": "玻利维亚",
+    "br": "巴西", "bw": "博茨瓦纳", "by": "白俄罗斯", "ca": "加拿大", "ch": "瑞士",
+    "ci": "科特迪瓦", "cl": "智利", "cm": "喀麦隆", "cn": "中国大陆", "co": "哥伦比亚",
+    "cr": "哥斯达黎加", "cy": "塞浦路斯", "cz": "捷克", "de": "德国", "dk": "丹麦",
+    "do": "多米尼加", "dz": "阿尔及利亚", "ec": "厄瓜多尔", "ee": "爱沙尼亚", "eg": "埃及",
+    "es": "西班牙", "fi": "芬兰", "fr": "法国", "gb": "英国", "ge": "格鲁吉亚",
+    "gh": "加纳", "gr": "希腊", "gt": "危地马拉", "hk": "香港", "hr": "克罗地亚",
+    "hu": "匈牙利", "id": "印尼", "ie": "爱尔兰", "il": "以色列", "in": "印度",
+    "iq": "伊拉克", "ir": "伊朗", "is": "冰岛", "it": "意大利", "jo": "约旦",
+    "jp": "日本", "ke": "肯尼亚", "kh": "柬埔寨", "kr": "韩国", "kw": "科威特",
+    "kz": "哈萨克斯坦", "la": "老挝", "lb": "黎巴嫩", "lk": "斯里兰卡", "lt": "立陶宛",
+    "lu": "卢森堡", "lv": "拉脱维亚", "ma": "摩洛哥", "md": "摩尔多瓦", "me": "黑山",
+    "mk": "北马其顿", "mm": "缅甸", "mn": "蒙古", "mo": "澳门", "mt": "马耳他",
+    "mx": "墨西哥", "my": "马来西亚", "mz": "莫桑比克", "na": "纳米比亚", "ng": "尼日利亚",
+    "nl": "荷兰", "no": "挪威", "np": "尼泊尔", "nz": "新西兰", "om": "阿曼",
+    "pa": "巴拿马", "pe": "秘鲁", "ph": "菲律宾", "pk": "巴基斯坦", "pl": "波兰",
+    "pr": "波多黎各", "pt": "葡萄牙", "py": "巴拉圭", "qa": "卡塔尔", "ro": "罗马尼亚",
+    "rs": "塞尔维亚", "ru": "俄罗斯", "sa": "沙特", "se": "瑞典", "sg": "新加坡",
+    "si": "斯洛文尼亚", "sk": "斯洛伐克", "sn": "塞内加尔", "th": "泰国", "tn": "突尼斯",
+    "tr": "土耳其", "tw": "台湾", "tz": "坦桑尼亚", "ua": "乌克兰", "ug": "乌干达",
+    "us": "美国", "uy": "乌拉圭", "uz": "乌兹别克斯坦", "ve": "委内瑞拉", "vn": "越南",
+    "za": "南非", "zm": "赞比亚", "zw": "津巴布韦",
+}
+TIER_ZH = {"RESI": "住宅IP", "PURE": "纯净", "GOOD": "良好", "RISKY": "高风险"}
+
 
 def log(msg):
     print(f"[pp {time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -178,16 +207,25 @@ def tier_of(rec):
 
 
 def existing_platforms():
-    status, data = api("/api/v1/platforms")
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = data.get("items") or []
-    else:
-        items = []
-    if status != 200:
-        log(f"取平台列表失败 status={status}")
-        return {}
+    """取全部平台（分页拉全，避免漏掉中文名导致重复创建 409）。"""
+    items = []
+    offset = 0
+    while True:
+        status, data = api(f"/api/v1/platforms?limit=500&offset={offset}")
+        if status != 200:
+            log(f"取平台列表失败 status={status}")
+            break
+        if isinstance(data, list):
+            items = data
+            break
+        if not isinstance(data, dict):
+            break
+        page = data.get("items") or []
+        items.extend(page)
+        total = data.get("total") or len(items)
+        if not page or len(items) >= total:
+            break
+        offset = len(items)
     return {p.get("name"): p for p in items if isinstance(p, dict)}
 
 
@@ -200,6 +238,9 @@ def ensure_platform(existing, name, payload):
         if status in (200, 201):
             log(f"新建平台 {name}（{payload.get('_desc', '')}）")
             return True
+        if status == 409:
+            # 并发/列表滞后导致的重复创建，视为已存在，下一轮会正常 PATCH
+            return False
         log(f"新建平台 {name} 失败 status={status} {str(data)[:160]}")
         return False
     changed = False
@@ -219,11 +260,55 @@ def ensure_platform(existing, name, payload):
     return False
 
 
-def regroup(nodes, cache):
-    """按国家 + 纯净度把节点分到平台。返回平台数。"""
-    existing = existing_platforms()
-    made = 0
+def managed_manifest_path():
+    return os.path.join(STATE_DIR, "managed.json")
 
+
+def load_manifest():
+    try:
+        with open(managed_manifest_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_manifest(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(managed_manifest_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+
+
+def is_managed_name(name):
+    """只清理本守护自己建的平台，绝不碰用户手建的（如 Default）。"""
+    if name in TIER_ZH.values() or name in COUNTRY_ZH.values():
+        return True
+    return bool(re.match(r"^PP-[A-Z0-9]{2,6}$", name))
+
+
+def cleanup_stale(existing, desired_names, manifest):
+    """连续两轮不在期望集合里的托管平台才删除，避免区号瞬时空导致抖动。"""
+    removed = 0
+    for name, plat in existing.items():
+        if name in desired_names or not is_managed_name(name):
+            continue
+        miss = int(manifest.get(name, {}).get("missed", 0)) + 1
+        manifest[name] = {"missed": miss}
+        if miss >= 2:
+            status, _ = api(f"/api/v1/platforms/{plat['id']}", "DELETE")
+            if status in (200, 204):
+                log(f"清理空平台 {name}（连续 {miss} 轮无节点）")
+                manifest.pop(name, None)
+                removed += 1
+    for name in list(manifest):
+        if name in desired_names:
+            manifest.pop(name, None)
+    return removed
+
+
+def regroup(nodes, cache):
+    """按国家 + 纯净度把节点分到平台（平台名用中文）。返回平台变更数。"""
+    existing = existing_platforms()
     by_country = {}
     by_tier = {}
     for n in nodes:
@@ -238,38 +323,43 @@ def regroup(nodes, cache):
         if tier:
             by_tier.setdefault(tier, []).append(tag)
 
-    # 国家平台：靠 region_filters，天然跟随节点增减
+    desired = {}
+    # 国家平台：靠 region_filters，天然跟随节点增减；名字显示中文
     for cc, tags in sorted(by_country.items()):
-        payload = {
-            "name": f"{PLATFORM_PREFIX}{cc.upper()}",
+        name = COUNTRY_ZH.get(cc, cc.upper())
+        desired[name] = {
+            "name": name,
             "region_filters": [cc],
             "allocation_policy": "BALANCED",
             "reverse_proxy_miss_action": "TREAT_AS_EMPTY",
-            "_desc": f"{cc.upper()} 共 {len(tags)} 节点",
+            "_desc": f"{cc.upper()} {len(tags)} 节点",
         }
-        if ensure_platform(existing, payload["name"], payload):
-            made += 1
 
     # 纯净度平台：靠 tag 精确匹配（Resin 只能按 tag/region 过滤）
     labels = {"RESI": "原生/住宅 IP", "PURE": f"风险系数<={TIER_PURE_MAX}",
               "GOOD": f"{TIER_PURE_MAX + 1}~{TIER_GOOD_MAX}", "RISKY": f">{TIER_GOOD_MAX}"}
-    for tier, labels_txt in labels.items():
+    for tier, zh in TIER_ZH.items():
         tags = sorted(set(by_tier.get(tier, [])))
         if not tags:
             continue
         if len(tags) > 300:
-            log(f"跳过 {tier}：节点数 {len(tags)} 超过 300，正则过大")
+            log(f"跳过 {zh}：节点数 {len(tags)} 超过 300，正则过大")
             continue
-        payload = {
-            "name": f"{PLATFORM_PREFIX}{tier}",
+        desired[zh] = {
+            "name": zh,
             "regex_filters": [f"^{re.escape(t)}$" for t in tags],
             "allocation_policy": "BALANCED",
             "reverse_proxy_miss_action": "TREAT_AS_EMPTY",
-            "_desc": f"{labels_txt}，{len(tags)} 节点",
+            "_desc": f"{labels[tier]}，{len(tags)} 节点",
         }
-        if ensure_platform(existing, payload["name"], payload):
-            made += 1
 
+    made = 0
+    for name, payload in desired.items():
+        if ensure_platform(existing, name, payload):
+            made += 1
+    manifest = load_manifest()
+    made += cleanup_stale(existing, set(desired), manifest)
+    save_manifest(manifest)
     return made
 
 

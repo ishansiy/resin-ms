@@ -57,15 +57,15 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
    `isResidential`（是否原生/住宅）、`countryCode`。并发 10，单轮上限 420 次探测。
 2. **缓存**：结果按 IP 落盘到持久盘 `/mnt/workspace/resin-data/purity/cache.json`，TTL 24 小时；
    `summary.json` 记录每轮评估数、平均风险系数、原生数量。
-3. **自动分组**：按结果幂等维护 Resin platforms（只增改，不删）：
+3. **自动分组**：按结果幂等维护 Resin platforms（平台名用中文；连续两轮无节点的托管平台会自动清理，用户手建的不动）：
 
 | 平台 | 含义 | 依据 |
 |---|---|---|
-| `PP-<CC>` | 按国家，如 `PP-JP`、`PP-US` | `region_filters=[cc]`（小写 ISO 两字母） |
-| `PP-RESI` | 原生/住宅 IP | tag 精确匹配 |
-| `PP-PURE` | 风险系数 ≤ 20 | 同上 |
-| `PP-GOOD` | 21 ~ 50 | 同上 |
-| `PP-RISKY` | > 50 | 同上 |
+| `<中文国名>` | 按国家，如 `日本`、`美国`、`香港` | `region_filters=[cc]`（小写 ISO 两字母） |
+| `住宅IP` | 原生/住宅 IP | tag 精确匹配 |
+| `纯净` | 风险系数 ≤ 20 | 同上 |
+| `良好` | 21 ~ 50 | 同上 |
+| `高风险` | > 50 | 同上 |
 
 > 坑：Resin 的 tag 正则匹配的是**完整候选串 `<订阅名>/<节点名>`**（等于 `display_tag`），
 > 只写节点名匹配不到任何节点，平台会一直 503 `No available nodes for routing`。
@@ -73,7 +73,18 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
 可用环境变量（在创空间里配 Variable 即可覆盖）：`PP_INTERVAL`（秒，默认 10800）、
 `PP_PROBE_MAX`（默认 420）、`PP_WORKERS`（默认 10）、`PP_CACHE_TTL`（默认 86400）。
 
-用法示例：走日本节点 → `https://<域名>/<代理令牌>/PP-JP/https/api.ipify.org?format=json`。
+用法示例：走日本节点 → `https://<域名>/<代理令牌>/日本/https/api.ipify.org?format=json`。
+
+⚠️ 平台名是中文，反代路径里的平台段**必须做百分号编码**（NFKC 无关，纯 URL 编码）：
+
+```bash
+PF=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("日本"))')   # %E6%97%A5%E6%9C%AC
+curl "https://resin.007666.xyz/<代理令牌>/$PF/https/api.ipify.org?format=json"
+# → {"ip":"60.137.146.81"}
+```
+
+不支持自动编码的客户端，可改用 ISO 国名平台（旧 ASCII 名 `PP-JP` 已被清理）；需要 ASCII 别名时
+把 `pp/daemon.py` 的 `COUNTRY_ZH` 改成 `f"{zh}-{cc.upper()}"` 之类的组合即可。
 
 ## 镜像标签
 
