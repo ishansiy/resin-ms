@@ -283,7 +283,9 @@ def is_managed_name(name):
     """只清理本守护自己建的平台，绝不碰用户手建的（如 Default）。"""
     if name in TIER_ZH.values() or name in COUNTRY_ZH.values():
         return True
-    return bool(re.match(r"^PP-[A-Z0-9]{2,6}$", name))
+    if re.match(r"^PP-[A-Z0-9]{2,6}$", name):   # 旧前缀命名
+        return True
+    return bool(re.match(r"^[A-Z]{2}$", name))  # 旧裸国家码（映射缺失回退产生）
 
 
 def cleanup_stale(existing, desired_names, manifest):
