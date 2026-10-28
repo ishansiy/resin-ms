@@ -23,6 +23,27 @@
 - 管理令牌支持三种投递方式：`X-Resin-Token` 头、`resin_admin` cookie（浏览器访问 `/t/<令牌>` 自动写入）、
   原生 `Authorization: Bearer`。后两者用于绕过托管平台边缘对 `Authorization` 的改写。
 
+## 访问入口
+
+| 入口 | 说明 |
+|---|---|
+| https://resin.007666.xyz | 自有域名（CF Worker `modelscope-gateway` 三件套：KV 路由 + 橙云 CNAME + Worker Route），浏览器导航不会 302 到平台页，cookie 为第一方 |
+| https://hansiy-resin.ms.fun | 创空间原始地址（仅供直连排障） |
+
+认证：面板登录与管理 API 都接受 `Authorization: Bearer <管理令牌>`；
+经自有域名时 Worker 会把 Bearer 转写成 `X-Resin-Token`（ms.fun 边缘对带 Authorization 的请求一律 403），
+镜像内 nginx 再映射回 Authorization 交给 Resin。因此三种写法都可用：
+
+```bash
+curl -H "Authorization: Bearer <管理令牌>"  https://resin.007666.xyz/api/v1/system/info   # 标准写法
+curl -H "X-Resin-Token: <管理令牌>"          https://resin.007666.xyz/api/v1/system/info   # 直连被边缘拦截时的备用
+curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 后直接进面板
+```
+
+⚠️ 反代路径请用**显式平台名**：`/<代理令牌>/<平台名>.<账号>/<https|http>/<目标地址>`。
+上游 README 里的 `./`（不指定平台）占位段在 ms.fun 边缘/CF Worker 的 URL 规范化下会被吞掉，
+表现为 `400 Failed to parse request URL`。
+
 ## 镜像标签
 
 | 标签 | 含义 |
