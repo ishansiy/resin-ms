@@ -143,6 +143,19 @@ log "nginx 已启动：对外 7860 → 面板 /ui/ ，API /api/ ，反代 /<令�
 ) &
 ROT_PID=$!
 
+# 后台 IPPure 纯净度守护：按国家/风险系数自动维护 platforms
+# 输出直接进容器日志（便于平台侧排查），状态落持久盘 $PERSIST_DIR/purity/
+PP_INTERVAL="${PP_INTERVAL:-10800}"
+(
+  PP_STATE_DIR="$PERSIST_DIR/purity" \
+  PP_INTERVAL="$PP_INTERVAL" \
+  PP_PUBLIC_BASE="http://127.0.0.1:7860" \
+  RESIN_LOCAL_API="http://127.0.0.1:${RESIN_PORT:-2260}" \
+  exec python3 /opt/resin-pp/daemon.py
+) &
+PP_PID=$!
+log "IPPure 守护已启动（每 ${PP_INTERVAL}s 一轮 → 自动维护 PP-<国家> 与 PP-{RESI,PURE,GOOD,RISKY} 平台）"
+
 cleanup() {
   trap - TERM INT EXIT
   log "收到退出信号，收尾中"
@@ -150,6 +163,7 @@ cleanup() {
   kill -TERM "$RESIN_PID" 2>/dev/null || true
   wait "$RESIN_PID" 2>/dev/null || true
   kill "$ROT_PID" 2>/dev/null || true
+  kill "$PP_PID" 2>/dev/null || true
   rotate
   exit 0
 }
