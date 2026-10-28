@@ -90,6 +90,13 @@ jobs:
       - name: 拉取上游源码（指定 tag）
         run: git clone --depth 1 --branch '${{ needs.check.outputs.version }}' "https://github.com/${UPSTREAM}.git" upstream
 
+      - name: 自检 nginx 配置与启动脚本语法
+        run: |
+          set -euo pipefail
+          sh -n start.sh
+          docker run --rm -v "$PWD/nginx.conf:/etc/resin/nginx.conf:ro" nginx:1.27-alpine \
+            nginx -t -c /etc/resin/nginx.conf
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
