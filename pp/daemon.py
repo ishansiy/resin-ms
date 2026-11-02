@@ -611,6 +611,40 @@ def cycle():
         json.dump(summary, f, ensure_ascii=False, indent=1)
 
 
+def code_fingerprint():
+    import hashlib
+    h = hashlib.sha256()
+    for f in (__file__, os.path.join(os.path.dirname(__file__), "ipsuper.py")):
+        try:
+            h.update(open(f, "rb").read())
+        except OSError:
+            h.update(b"missing")
+    return h.hexdigest()[:12]
+
+
+def selftest_ipsuper():
+    global IPSUPER_ENABLE
+    if not (IPSUPER_ENABLE and ipsuper):
+        log("自检 ipsuper：跳过（未启用或模块缺失）")
+        return
+    try:
+        rec = ipsuper.probe("8.8.8.8", timeout=IPSUPER_TIMEOUT)
+        log(
+            "自检 ipsuper：ok={} safe={} cc={} asn={} votes={} err={} dom_len={} stderr={}".format(
+                rec.get("ok"), rec.get("safe_score"), rec.get("cc"), rec.get("asn"),
+                (rec.get("type_votes") or [])[:3], rec.get("error"),
+                rec.get("dom_len"), (rec.get("stderr") or "")[:160],
+            )
+        )
+        if rec.get("dom_excerpt"):
+            log(f"自检 ipsuper DOM 片段：{rec['dom_excerpt'][:300]}")
+        if not rec.get("ok"):
+            IPSUPER_ENABLE = False
+            log("自检失败 → 本轮起 ipsuper 关闭，全部走 IPPure 兜底")
+    except Exception as exc:  # noqa: BLE001
+        log(f"自检 ipsuper 抛异常：{type(exc).__name__}: {exc}")
+
+
 def main():
     if not ADMIN or not PROXY:
         log("缺少 RESIN_ADMIN_TOKEN / RESIN_PROXY_TOKEN，退出")
@@ -618,7 +652,9 @@ def main():
     log(f"启动：每 {INTERVAL}s 一轮，缓存 TTL {CACHE_TTL}s，探测上限 {PROBE_MAX} 次/轮")
     log(f"数据源：ipsuper={'开' if IPSUPER_ENABLE else '关'}（并发 {BROWSER_WORKERS}），"
         f"IPPure 兜底={'开' if IPPURE_FALLBACK else '关'}")
+    log(f"代码指纹 {code_fingerprint()}（daemon.py + ipsuper.py）")
     time.sleep(90)  # 等 resin + nginx 起来
+    selftest_ipsuper()
     while True:
         try:
             cycle()
