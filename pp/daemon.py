@@ -675,6 +675,8 @@ def selftest_ipsuper():
         )
         if rec.get("dom_excerpt"):
             log(f"自检 ipsuper DOM 片段：{rec['dom_excerpt'][:300]}")
+        if rec.get("diag"):
+            log(f"自检 ipsuper 控制台/网络：{rec['diag'][:600]}")
         if not rec.get("ok"):
             IPSUPER_ENABLE = False
             log("自检失败 → 本轮起 ipsuper 关闭，全部走 IPPure 兜底")

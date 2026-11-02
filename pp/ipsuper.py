@@ -208,6 +208,7 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
     profile = tempfile.mkdtemp(prefix="ipsuper-")
     args = [
         bin_path, "--headless=new", "--disable-gpu", "--no-sandbox",
+        "--enable-logging=stderr", "--log-level=0",
         "--disable-dev-shm-usage", "--no-first-run", "--disable-extensions",
         "--disable-background-networking", "--disable-sync", "--mute-audio",
         "--hide-scrollbars", "--blink-settings=imagesEnabled=false",
@@ -223,6 +224,9 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
         if not dom or len(dom) < 2000:
             raise RuntimeError(f"DOM 为空或过短 len={len(dom)} stderr={last_err}")
         fetch.last_stderr = last_err
+        keep = [x for x in err.splitlines()
+                if ("CONSOLE" in x or "ERR_" in x or "ERROR:" in x and "gl_display" not in x)]
+        fetch.last_diag = " || ".join(keep[-8:])[:700]
         return dom
     finally:
         shutil.rmtree(profile, ignore_errors=True)
@@ -239,6 +243,7 @@ def probe(ip, timeout=60, chrome=None, budget_ms=11000):
             res.setdefault("dom_excerpt", probe_text)
             res["dom_len"] = len(dom)
             res["stderr"] = getattr(fetch, "last_stderr", "")[:200]
+            res["diag"] = getattr(fetch, "last_diag", "")
         return res
     except Exception as exc:  # noqa: BLE001
         return {"ip": ip, "ok": False, "source": "ipsuper", "error": str(exc)[:200]}
