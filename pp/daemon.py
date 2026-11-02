@@ -42,10 +42,11 @@ STATE_DIR = os.environ.get("PP_STATE_DIR", "/mnt/workspace/resin-data/purity")
 INTERVAL = int(os.environ.get("PP_INTERVAL", "10800"))
 TAG_WATCH = int(os.environ.get("PP_TAG_WATCH", "300"))      # 5 分钟看一眼节点名
 CACHE_TTL = int(os.environ.get("PP_CACHE_TTL", "86400"))    # 24h
+CACHE_FAIL_TTL = int(os.environ.get("PP_CACHE_FAIL_TTL", "21600"))  # 失败结果 6h
 PROBE_MAX = int(os.environ.get("PP_PROBE_MAX", "420"))      # 单轮最大探测请求数
 WORKERS = int(os.environ.get("PP_WORKERS", "10"))           # IPPure 兜底并发度
-BROWSER_WORKERS = int(os.environ.get("PP_BROWSER_WORKERS", "3"))   # ipsuper 无头浏览器并发度
-IPSUPER_TIMEOUT = int(os.environ.get("PP_IPSUPER_TIMEOUT", "90"))  # 单个 IP 渲染超时
+BROWSER_WORKERS = int(os.environ.get("PP_BROWSER_WORKERS", "5"))   # ipsuper 无头浏览器并发度
+IPSUPER_TIMEOUT = int(os.environ.get("PP_IPSUPER_TIMEOUT", "60"))  # 单个 IP 渲染超时
 IPSUPER_ENABLE = os.environ.get("PP_IPSUPER", "1") != "0" and ipsuper is not None
 IPPURE_FALLBACK = os.environ.get("PP_IPPURE_FALLBACK", "1") != "0"
 REPROBE_FOREIGN = os.environ.get("PP_REPROBE_FOREIGN", "1") != "0"  # 非 ipsuper 来源的旧缓存当过期，一次性迁移
@@ -152,6 +153,8 @@ def cache_record_valid(rec):
     """只认字段看得住的结果，历史上 --dump-dom 写进去的外壳垃圾一律丢弃。"""
     if not isinstance(rec, dict):
         return False
+    if rec.get("ok") is False:   # 「查不到」也是结论，留着免得每轮重烧时间
+        return True
     if not rec.get("cc") or len(str(rec.get("cc"))) != 2:
         return False
     if not re.match(r"^AS\d{1,10}$", str(rec.get("asn") or "")):
@@ -268,6 +271,8 @@ def collect_ipsuper(cache, missing):
     errs = []
     samples = []
 
+    done = [0]
+
     def worker(ip):
         nonlocal hits
         rec = ipsuper.probe(ip, timeout=IPSUPER_TIMEOUT)
@@ -277,6 +282,14 @@ def collect_ipsuper(cache, missing):
                 if rec.get("dom_excerpt"):
                     extra = f" | dom_len={rec.get('dom_len')} | {rec.get('dom_excerpt')}"
                 errs.append(f"{ip}: {rec.get('error')}{extra}")
+            # ipsuper 查不到（常见的死节点/私有段）也落缓存，6h 内不再重复烧时间
+            with lock:
+                cache[ip] = {"ip": ip, "ok": False, "source": "ipsuper",
+                             "reason": (rec.get("error") or "no-data")[:80], "ts": int(time.time())}
+                missing.discard(ip)
+                done[0] += 1
+                if done[0] % 25 == 0:
+                    log(f"ipsuper 进度 {done[0]}/{len(todo)}（成功 {hits}）")
             return
         norm = normalize_ipsuper(rec)
         if not norm.get("ip"):
@@ -284,7 +297,10 @@ def collect_ipsuper(cache, missing):
         with lock:
             cache[norm["ip"]] = norm
             hits += 1
+            done[0] += 1
             missing.discard(norm["ip"])
+            if done[0] % 25 == 0:
+                log(f"ipsuper 进度 {done[0]}/{len(todo)}（成功 {hits}）")
             if len(samples) < 3:
                 samples.append(
                     f"{norm['ip']} safe={norm.get('safe_score')} risk={norm.get('score')} "
@@ -352,7 +368,7 @@ def node_tag(node):
 
 
 def tier_of(rec):
-    if not rec:
+    if not rec or rec.get("ok") is False:
         return None
     if rec.get("residential"):
         return "RESI"
@@ -592,7 +608,9 @@ def cache_stale(rec, now):
     if not isinstance(rec, dict):
         return True
     ts = int(rec.get("ts") or 0)
-    if now - ts > CACHE_TTL:
+    # 失败结果用更短的 TTL（查不到的 IP 别每轮重烧一分钟）
+    ttl = CACHE_FAIL_TTL if rec.get("ok") is False else CACHE_TTL
+    if now - ts > ttl:
         return True
     # 数据源迁移：老 ippure 条目在 ipsuper 可用时一律重测，避免两套评分混用
     if IPSUPER_ENABLE and REPROBE_FOREIGN and rec.get("source") != "ipsuper":

@@ -242,8 +242,8 @@ def probe(ip, timeout=60, chrome=None, budget_ms=11000, extra_args=None, use_cdp
     """查询单个 IP：优先 CDP 等数据渲染，失败再退回 --dump-dom；异常返回 ok=False。"""
     if use_cdp:
         try:
-            dom = fetch_cdp(ip, timeout=max(timeout, 90), chrome=chrome,
-                            extra_args=extra_args, data_wait=max(20, timeout // 2))
+            dom = fetch_cdp(ip, timeout=max(timeout, 60), chrome=chrome,
+                            extra_args=extra_args, data_wait=DATA_WAIT)
             res = parse(ip, dom)
             if res.get("ok"):
                 res["via"] = "cdp"
@@ -251,6 +251,10 @@ def probe(ip, timeout=60, chrome=None, budget_ms=11000, extra_args=None, use_cdp
             probe.last_cdp_error = res.get("error")
         except Exception as exc:  # noqa: BLE001
             probe.last_cdp_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            # CDP 超时基本等于该 IP 在 ipsuper 上没数据，再退回 dump-dom 只是白等
+            if "等待数据超时" in str(exc):
+                return {"ip": ip, "ok": False, "error": "no-data(cdp-timeout)",
+                        "cdp_error": probe.last_cdp_error}
     try:
         dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms,
                     extra_args=extra_args)
@@ -487,6 +491,9 @@ class _CDP:
             pass
 
 
+DATA_WAIT = max(8, int(os.environ.get("PP_IPSUPER_WAIT", "18")))
+
+
 def _devtools_port(profile, deadline):
     import os as _os
     import time as _time
@@ -502,7 +509,7 @@ def _devtools_port(profile, deadline):
     return None
 
 
-def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=35):
+def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=18):
     """用 CDP 打开页面，等数据真正渲染出来再取 outerHTML。"""
     import json as _json
     import subprocess
