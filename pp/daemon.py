@@ -652,6 +652,18 @@ def selftest_ipsuper():
     if not (IPSUPER_ENABLE and ipsuper):
         log("自检 ipsuper：跳过（未启用或模块缺失）")
         return
+    # 三组参数对照：找出在 Alpine Chromium 下能真正拿到数据的那一组
+    for tag, budget in (("11s", 11000), ("25s", 25000), ("45s", 45000)):
+        try:
+            r = ipsuper.probe("8.8.8.8", timeout=IPSUPER_TIMEOUT, budget_ms=budget)
+        except Exception as exc:  # noqa: BLE001
+            log(f"自检[{tag}] 异常：{type(exc).__name__}: {exc}")
+            continue
+        log(
+            f"自检[{tag}] ok={r.get('ok')} safe={r.get('safe_score')} cc={r.get('cc')} "
+            f"asn={r.get('asn')} votes={(r.get('type_votes') or [])[:3]} dom_len={r.get('dom_len')} "
+            f"err={r.get('error')}"
+        )
     try:
         rec = ipsuper.probe("8.8.8.8", timeout=IPSUPER_TIMEOUT)
         log(
