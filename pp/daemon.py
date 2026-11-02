@@ -153,8 +153,6 @@ def cache_record_valid(rec):
     """只认字段看得住的结果，历史上 --dump-dom 写进去的外壳垃圾一律丢弃。"""
     if not isinstance(rec, dict):
         return False
-    if rec.get("ok") is False:   # 「查不到」也是结论，留着免得每轮重烧时间
-        return True
     if not rec.get("cc") or len(str(rec.get("cc"))) != 2:
         return False
     if not re.match(r"^AS\d{1,10}$", str(rec.get("asn") or "")):
@@ -259,9 +257,30 @@ def normalize_ipsuper(rec):
     }
 
 
+def load_skip():
+    try:
+        with open(os.path.join(STATE_DIR, "ipsuper_skip.json"), encoding="utf-8") as f:
+            return {k: int(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def save_skip(skip):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, "ipsuper_skip.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(skip, f)
+    os.replace(tmp, path)
+
+
 def collect_ipsuper(cache, missing):
     """用 ipsuper 按「出口 IP」直查：不必把请求从节点代理出去。"""
-    todo = sorted(missing)[:PROBE_MAX]
+    skip = load_skip()
+    now = int(time.time())
+    skip = {ip: ts for ip, ts in skip.items() if now - ts < CACHE_FAIL_TTL}
+    pool_ips = [ip for ip in missing if ip not in skip]
+    todo = sorted(pool_ips)[:PROBE_MAX]
     if not todo:
         return 0, missing
     log(f"ipsuper 待查 {len(todo)} 个出口 IP（并发 {BROWSER_WORKERS}）")
@@ -282,14 +301,12 @@ def collect_ipsuper(cache, missing):
                 if rec.get("dom_excerpt"):
                     extra = f" | dom_len={rec.get('dom_len')} | {rec.get('dom_excerpt')}"
                 errs.append(f"{ip}: {rec.get('error')}{extra}")
-            # ipsuper 查不到（常见的死节点/私有段）也落缓存，6h 内不再重复烧时间
+            # 查不到就记冷却（6h 内不再问 ipsuper），但**保留在 missing 里**交给 IPPure 兜底
             with lock:
-                cache[ip] = {"ip": ip, "ok": False, "source": "ipsuper",
-                             "reason": (rec.get("error") or "no-data")[:80], "ts": int(time.time())}
-                missing.discard(ip)
+                skip[ip] = int(time.time())
                 done[0] += 1
                 if done[0] % 25 == 0:
-                    log(f"ipsuper 进度 {done[0]}/{len(todo)}（成功 {hits}）")
+                    log(f"ipsuper 进度 {done[0]}/{len(todo)}（成功 {hits}，其余转 IPPure）")
             return
         norm = normalize_ipsuper(rec)
         if not norm.get("ip"):
@@ -313,6 +330,7 @@ def collect_ipsuper(cache, missing):
         log(f"ipsuper 样本 {line}")
     for line in errs:
         log(f"ipsuper 失败 {line}")
+    save_skip(skip)
     return hits, missing
 
 
@@ -612,9 +630,7 @@ def cache_stale(rec, now):
     ttl = CACHE_FAIL_TTL if rec.get("ok") is False else CACHE_TTL
     if now - ts > ttl:
         return True
-    # 数据源迁移：老 ippure 条目在 ipsuper 可用时一律重测，避免两套评分混用
-    if IPSUPER_ENABLE and REPROBE_FOREIGN and rec.get("source") != "ipsuper":
-        return True
+    # 注：ipsuper 对大多数机场出口查不到数据，ippure 结果不再强制重测（否则每轮白烧）。
     return False
 
 

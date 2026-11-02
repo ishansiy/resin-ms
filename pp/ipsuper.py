@@ -186,10 +186,13 @@ def parse(ip, html):
     votes_ok = bool(votes) and any(
         any(w in v for w in RESIDENTIAL_WORDS + IDC_WORDS + ("未知", "企业", "教育")) for v in votes
     )
-    if not asn_ok or not cc or not votes_ok or safe in (None, 0) and False:
-        pass
     # 严格校验：只渲染出 SSR 外壳（XHR 未返回）时，页面里仍有静态的「越大越好 / 100」，
     # 会把安全分误读成 100 → 风险 0。没有位置/ASN/使用类型就一律判失败，交给兜底通道。
+    if any(re.search(r"失败|无数据|暂无|未收录", str(v)) for v in votes):
+        # 页面明确说这 IP 查不到：安全分是静态壳里的 100，绝不能当成「很干净」
+        out["ok"] = False
+        out["error"] = f"no-data(page votes={votes[:3]!r})"
+        return out
     if not asn_ok or not cc or not votes_ok:
         out["ok"] = False
         out["error"] = (
@@ -491,7 +494,7 @@ class _CDP:
             pass
 
 
-DATA_WAIT = max(8, int(os.environ.get("PP_IPSUPER_WAIT", "18")))
+DATA_WAIT = max(6, int(os.environ.get("PP_IPSUPER_WAIT", "10")))
 
 
 def _devtools_port(profile, deadline):
@@ -509,7 +512,7 @@ def _devtools_port(profile, deadline):
     return None
 
 
-def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=18):
+def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=10):
     """用 CDP 打开页面，等数据真正渲染出来再取 outerHTML。"""
     import json as _json
     import subprocess
@@ -556,14 +559,19 @@ def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=18):
                 res = cdp.call(
                     "Runtime.evaluate",
                     {"expression": "(() => { const t = document.body ? document.body.innerText : '';"
+                                   "const asn = (t.match(/AS\\d{2,}/) || [])[0] || '';"
+                                   "const nil = /失败|无数据|暂无|未收录|查询不到/.test(t);"
                                    "return JSON.stringify({n: t.length, has: t.indexOf('综合安全分') >= 0,"
-                                   "ph: (t.match(/~/g) || []).length});})()",
+                                   "asn: asn, nil: nil, ph: (t.match(/~/g) || []).length});})()",
                      "returnByValue": True},
                     timeout=15,
                 )
                 raw = (res.get("result") or {}).get("value") or "{}"
                 st = _json.loads(raw)
-                if st.get("has") and st.get("ph", 1) == 0 and st.get("n", 0) > 800:
+                # 三种终态都算「渲染完了」：真实 ASN / 页面明确说查不到 / 占位符全消失
+                if st.get("n", 0) > 600 and (
+                    st.get("asn") or st.get("nil") or (st.get("has") and st.get("ph", 1) == 0)
+                ):
                     ready = True
                     break
                 _time.sleep(0.7)
