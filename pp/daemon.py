@@ -647,6 +647,32 @@ def netcheck():
     log("网络探针 " + _get("https://api.ipsuper.com/endpoint", method="POST", data=b"{}"))
 
 
+def selftest_js():
+    """最小 JS 执行测试：内联脚本能否改写 DOM。"""
+    import subprocess as sp
+    import tempfile as tf
+    bin_path = ipsuper.chrome_bin() if ipsuper else None
+    if not bin_path:
+        log("JS 自检：跳过（找不到浏览器）")
+        return
+    html = "<html><body><div id=x>BEFORE</div><script>document.getElementById('x').textContent='JSRAN';</script></body></html>"
+    d = tf.mkdtemp(prefix="jstest-")
+    path = os.path.join(d, "t.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    try:
+        r = sp.run([bin_path, "--headless=new", "--disable-gpu", "--no-sandbox",
+                    "--disable-dev-shm-usage", f"--user-data-dir={d}/prof",
+                    "--virtual-time-budget=3000", "--dump-dom", f"file://{path}"],
+                   capture_output=True, timeout=60)
+        out = r.stdout.decode("utf-8", "replace")
+        log(f"JS 自检：JSRAN={'JSRAN' in out} dom_len={len(out)}")
+        if "JSRAN" not in out:
+            log(f"JS 自检 DOM：{out[:200]}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"JS 自检异常：{type(exc).__name__}: {exc}")
+
+
 def selftest_ipsuper():
     global IPSUPER_ENABLE
     if not (IPSUPER_ENABLE and ipsuper):
@@ -694,6 +720,7 @@ def main():
     log(f"代码指纹 {code_fingerprint()}（daemon.py + ipsuper.py）")
     time.sleep(90)  # 等 resin + nginx 起来
     netcheck()
+    selftest_js()
     selftest_ipsuper()
     while True:
         try:
