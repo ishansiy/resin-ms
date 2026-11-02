@@ -60,6 +60,14 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
    `xpa/xpq/xpw/xrd` 签名头和二进制加密 body），所以只能走渲染解析。
 2. **采集（兜底 IPPure）**：ipsuper 查不到的 IP，回退旧通道 —— 经 Resin 反代轮询节点出口，
    请求 `https://my.ippure.com/v1/info` 拿 `fraudScore`。
+
+   **实测口径（别抱幻想）**：机场出口大量是冷门 VPS IP，ipsuper 页面要么显示「失败」，要么
+   30–60 秒才渲染完 —— 一轮下来 ipsuper 通常只覆盖个位数到十几个节点，**主力实际上是 IPPure**
+   （133 个出口 IP 约 30 秒覆盖一半，受节点可用性限制）。所以：
+   - ipsuper 单次等待收到 `PP_IPSUPER_WAIT`（默认 10s），只捡「它真的有数据且渲染快」的 IP；
+   - ipsuper 页面对某 IP 明确回「失败/无数据」时**判为无数据**，绝不能把它壳里静态的 100 分
+     当成「很干净的 IP」；
+   - 查不到的 IP 记入 `ipsuper_skip.json` 冷却 6h，但**仍交给 IPPure 兜底**，不被判成「已完成」。
 3. **缓存**：结果按 IP 落盘到持久盘 `/mnt/workspace/resin-data/purity/cache.json`，TTL 24 小时；
    `summary.json` 记录每轮评估数、平均风险分、住宅数、各数据源条数。
 4. **自动分组**：按结果幂等维护 Resin platforms（平台名用中文；连续两轮无节点的托管平台会自动清理，用户手建的不动）：
@@ -80,7 +88,8 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
 
 可用环境变量（在创空间里配 Variable 即可覆盖）：
 `PP_INTERVAL`（秒，默认 10800）、`PP_CACHE_TTL`（默认 86400）、`PP_PROBE_MAX`（单轮上限，默认 420）、
-`PP_IPSUPER`（默认 1，设 0 关闭 ipsuper 只用 IPPure）、`PP_BROWSER_WORKERS`（浏览器并发，默认 3）、
+`PP_IPSUPER`（默认 1，设 0 关闭 ipsuper 只用 IPPure）、`PP_IPSUPER_WAIT`（单 IP 等渲染秒数，默认 10）、
+`PP_BROWSER_WORKERS`（浏览器并发，默认 5）、`PP_CACHE_FAIL_TTL`（查不到结果的冷却时间，默认 21600s）、
 `PP_IPSUPER_TIMEOUT`（单 IP 渲染超时秒，默认 90）、`PP_IPPURE_FALLBACK`（默认 1）、
 `PP_REPROBE_FOREIGN`（默认 1：非 ipsuper 来源的旧缓存一律重测，用于数据源迁移）、
 `PP_WORKERS`（IPPure 兜底并发，默认 10）。
@@ -159,3 +168,15 @@ docker run --rm -p 7860:7860 \
 | `RESIN_ADMIN_TOKEN` | 面板与管理 API 令牌；未提供则随机生成并打印在启动日志、写入持久盘 |
 | `RESIN_PROXY_TOKEN` | 反向代理路径首段令牌；同上 |
 | `RESIN_SNAPSHOT_INTERVAL` | 状态快照间隔秒数，默认 120 |
+
+### 平台重建的两个必做动作（血泪）
+
+Resin 的纯净度分层平台靠 `regex_filters` 精确匹配节点名，而订阅每次刷新会**整批换节点名**
+（`DE-Berlin-10622315-eedp` → `DE-Berlin-317722916-wfpf`）。平台看着还「有 40 条规则」，
+其实一条都匹配不到，反代直接 `503 No available nodes for routing`。所以：
+
+1. **探测前取的节点名不能直接用来建平台**：一轮探测要十几分钟，期间可能刚好刷新 →
+   重建前必须重新拉一次 `/api/v1/nodes`（否则刚建好就是过期名单）。
+2. **常驻 tag 探针**：守护每 `PP_TAG_WATCH`（默认 300s）算一次节点名指纹，变了立刻只重建平台、
+   不重新探测（探测缓存按出口 IP 存，改名不影响）。没有这道探针，任何一次容器重启或订阅刷新
+   都会让分层平台失效到下一轮（最长 3 小时）。
