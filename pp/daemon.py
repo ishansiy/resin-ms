@@ -241,10 +241,15 @@ def collect_ipsuper(cache, missing):
     lock = threading.Lock()
     hits = 0
 
+    errs = []
+    samples = []
+
     def worker(ip):
         nonlocal hits
         rec = ipsuper.probe(ip, timeout=IPSUPER_TIMEOUT)
         if not rec.get("ok"):
+            if len(errs) < 3:
+                errs.append(f"{ip}: {rec.get('error')}")
             return
         norm = normalize_ipsuper(rec)
         if not norm.get("ip"):
@@ -253,9 +258,18 @@ def collect_ipsuper(cache, missing):
             cache[norm["ip"]] = norm
             hits += 1
             missing.discard(norm["ip"])
+            if len(samples) < 3:
+                samples.append(
+                    f"{norm['ip']} safe={norm.get('safe_score')} risk={norm.get('score')} "
+                    f"cc={norm.get('cc')} resi={norm.get('residential')} asn={norm.get('asn')}"
+                )
 
     with futures.ThreadPoolExecutor(max_workers=BROWSER_WORKERS) as pool:
         list(pool.map(worker, todo))
+    for line in samples:
+        log(f"ipsuper 样本 {line}")
+    for line in errs:
+        log(f"ipsuper 失败 {line}")
     return hits, missing
 
 

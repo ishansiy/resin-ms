@@ -180,6 +180,12 @@ def parse(ip, html):
                     cc = iso
                     break
     out["cc"] = cc
+    # 严格校验：只渲染出 SSR 外壳（XHR 未返回）时，页面里仍有静态的「越大越好 / 100」，
+    # 会把安全分误读成 100 → 风险 0。没有位置/ASN/使用类型就一律判失败，交给兜底通道。
+    if not out.get("location") or not out.get("asn") or not out.get("type_votes"):
+        out["ok"] = False
+        out["error"] = "shell_only(no location/asn/type)"
+        return out
     out["ok"] = True
     return out
 
