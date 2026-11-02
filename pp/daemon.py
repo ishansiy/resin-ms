@@ -39,7 +39,8 @@ PUBLIC_BASE = os.environ.get("PP_PUBLIC_BASE", "http://127.0.0.1:7860")
 ADMIN = os.environ.get("RESIN_ADMIN_TOKEN", "")
 PROXY = os.environ.get("RESIN_PROXY_TOKEN", "")
 STATE_DIR = os.environ.get("PP_STATE_DIR", "/mnt/workspace/resin-data/purity")
-INTERVAL = int(os.environ.get("PP_INTERVAL", "10800"))      # 3h
+INTERVAL = int(os.environ.get("PP_INTERVAL", "10800"))
+TAG_WATCH = int(os.environ.get("PP_TAG_WATCH", "300"))      # 5 分钟看一眼节点名
 CACHE_TTL = int(os.environ.get("PP_CACHE_TTL", "86400"))    # 24h
 PROBE_MAX = int(os.environ.get("PP_PROBE_MAX", "420"))      # 单轮最大探测请求数
 WORKERS = int(os.environ.get("PP_WORKERS", "10"))           # IPPure 兜底并发度
@@ -562,6 +563,15 @@ def regroup(nodes, cache):
     return made
 
 
+def tags_hash(nodes):
+    """节点名指纹：订阅刷新会重命名节点，凭它判断要不要重建 tag 型平台。"""
+    import hashlib
+    h = hashlib.sha256()
+    for t in sorted(node_tag(n) for n in nodes if node_tag(n)):
+        h.update(t.encode())
+    return h.hexdigest()[:12]
+
+
 def nudge_egress(nodes):
     """对还没有出口 IP 的节点触发一次 egress 探测，帮助补齐状态。"""
     todo = [n for n in nodes if not n.get("egress_ip")][:EGRESS_PROBE_MAX]
@@ -749,12 +759,25 @@ def main():
     netcheck()
     selftest_js()
     selftest_ipsuper()
+    last_full = 0.0
+    last_tags = None
     while True:
         try:
-            cycle()
-        except Exception as exc:
+            if time.time() - last_full >= INTERVAL:
+                cycle()
+                last_full = time.time()
+                last_tags = tags_hash(fetch_nodes() or [])
+            else:
+                cur_nodes = fetch_nodes() or []
+                cur = tags_hash(cur_nodes)
+                if cur_nodes and last_tags and cur != last_tags:
+                    log(f"节点名变化（{last_tags} → {cur}），只重建平台、不重新探测")
+                    made = regroup(cur_nodes, load_cache())
+                    log(f"平台重建完成，变更 {made} 个")
+                    last_tags = cur
+        except Exception as exc:  # noqa: BLE001
             log(f"本轮异常：{type(exc).__name__}: {exc}")
-        time.sleep(INTERVAL)
+        time.sleep(TAG_WATCH)
 
 
 if __name__ == "__main__":
