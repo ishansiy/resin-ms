@@ -180,11 +180,21 @@ def parse(ip, html):
                     cc = iso
                     break
     out["cc"] = cc
+    # 数值字段必须长得像真的：ASN 形如 AS16509、国家可映射、使用类型非空且含常见词
+    asn_ok = bool(re.match(r"^AS\d{1,10}$", str(out.get("asn") or "")))
+    votes = out.get("type_votes") or []
+    votes_ok = bool(votes) and any(
+        any(w in v for w in RESIDENTIAL_WORDS + IDC_WORDS + ("未知", "企业", "教育")) for v in votes
+    )
+    if not asn_ok or not cc or not votes_ok or safe in (None, 0) and False:
+        pass
     # 严格校验：只渲染出 SSR 外壳（XHR 未返回）时，页面里仍有静态的「越大越好 / 100」，
     # 会把安全分误读成 100 → 风险 0。没有位置/ASN/使用类型就一律判失败，交给兜底通道。
-    if not out.get("location") or not out.get("asn") or not out.get("type_votes"):
+    if not asn_ok or not cc or not votes_ok:
         out["ok"] = False
-        out["error"] = "shell_only(no location/asn/type)"
+        out["error"] = (
+            f"unverified(asn={out.get('asn')!r} cc={cc!r} votes={votes[:3]!r} safe={safe!r})"
+        )
         return out
     out["ok"] = True
     return out
@@ -208,8 +218,11 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
     try:
         r = subprocess.run(args, capture_output=True, timeout=timeout)
         dom = r.stdout.decode("utf-8", "replace")
+        err = r.stderr.decode("utf-8", "replace")
+        last_err = " | ".join([x for x in err.splitlines() if x.strip()][-3:])[:300]
         if not dom or len(dom) < 2000:
-            raise RuntimeError(f"DOM 为空或过短 len={len(dom)}")
+            raise RuntimeError(f"DOM 为空或过短 len={len(dom)} stderr={last_err}")
+        fetch.last_stderr = last_err
         return dom
     finally:
         shutil.rmtree(profile, ignore_errors=True)
@@ -220,8 +233,12 @@ def probe(ip, timeout=60, chrome=None, budget_ms=11000):
     try:
         dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms)
         res = parse(ip, dom)
-        if not res.get("ok"):
-            res["error"] = "parse_failed"
+        if not res.get("ok") or (res.get("safe_score") or 0) >= 99:
+            lines = _strip_dom(dom)
+            probe_text = " / ".join(lines[:60])[:400]
+            res.setdefault("dom_excerpt", probe_text)
+            res["dom_len"] = len(dom)
+            res["stderr"] = getattr(fetch, "last_stderr", "")[:200]
         return res
     except Exception as exc:  # noqa: BLE001
         return {"ip": ip, "ok": False, "source": "ipsuper", "error": str(exc)[:200]}

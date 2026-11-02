@@ -249,7 +249,10 @@ def collect_ipsuper(cache, missing):
         rec = ipsuper.probe(ip, timeout=IPSUPER_TIMEOUT)
         if not rec.get("ok"):
             if len(errs) < 3:
-                errs.append(f"{ip}: {rec.get('error')}")
+                extra = ""
+                if rec.get("dom_excerpt"):
+                    extra = f" | dom_len={rec.get('dom_len')} | {rec.get('dom_excerpt')}"
+                errs.append(f"{ip}: {rec.get('error')}{extra}")
             return
         norm = normalize_ipsuper(rec)
         if not norm.get("ip"):
