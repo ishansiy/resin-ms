@@ -613,6 +613,12 @@ def cycle():
     hits = collect(cache, targets)
     save_cache(cache)
 
+    # 探测可能跑十几分钟，期间订阅刷新会整批改节点名 → 重建平台前重新拉一次节点
+    fresh = fetch_nodes()
+    if fresh:
+        if tags_hash(fresh) != tags_hash(nodes):
+            log("探测期间节点名有变化，按最新节点列表重建平台")
+        nodes = fresh
     made = regroup(nodes, cache)
     known = [cache.get(n.get("egress_ip") or "") for n in nodes]
     scored = [r for r in known if isinstance(r, dict)]
