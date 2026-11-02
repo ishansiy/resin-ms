@@ -200,7 +200,11 @@ def parse(ip, html):
     return out
 
 
-def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
+NORMAL_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+
+
+def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000, extra_args=None):
     """渲染 ipsuper 页面并返回原始 DOM。失败抛异常。"""
     bin_path = chrome or chrome_bin()
     if not bin_path:
@@ -216,6 +220,8 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
         f"--virtual-time-budget={extra_wait_ms}", "--dump-dom",
         f"https://ipsuper.com/?ip={ip}",
     ]
+    if extra_args:
+        args[1:1] = list(extra_args)
     try:
         r = subprocess.run(args, capture_output=True, timeout=timeout)
         dom = r.stdout.decode("utf-8", "replace")
@@ -232,10 +238,11 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
         shutil.rmtree(profile, ignore_errors=True)
 
 
-def probe(ip, timeout=60, chrome=None, budget_ms=11000):
+def probe(ip, timeout=60, chrome=None, budget_ms=11000, extra_args=None):
     """查询单个 IP；异常时返回 ok=False 且带 error。"""
     try:
-        dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms)
+        dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms,
+                    extra_args=extra_args)
         res = parse(ip, dom)
         if not res.get("ok") or (res.get("safe_score") or 0) >= 99:
             lines = _strip_dom(dom)
