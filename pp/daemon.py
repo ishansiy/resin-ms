@@ -622,6 +622,31 @@ def code_fingerprint():
     return h.hexdigest()[:12]
 
 
+def netcheck():
+    """容器内网络连通性探针：区分「网络被封」与「浏览器没渲染出结果」。"""
+    import subprocess as sp
+    def _get(url, method="GET", data=None):
+        try:
+            req = urllib.request.Request(url, data=data, method=method,
+                                         headers={"User-Agent": "Mozilla/5.0 Chrome/126"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = r.read(400)
+                return f"{method} {url} -> {r.status} len={len(body)}"
+        except urllib.error.HTTPError as e:
+            return f"{method} {url} -> HTTP {e.code}"
+        except Exception as exc:  # noqa: BLE001
+            return f"{method} {url} -> {type(exc).__name__}: {str(exc)[:90]}"
+    try:
+        ver = sp.run([ipsuper.chrome_bin() or "chromium", "--version"],
+                     capture_output=True, timeout=20).stdout.decode("utf-8", "replace").strip()
+    except Exception as exc:  # noqa: BLE001
+        ver = f"未知({exc})"
+    log(f"浏览器版本：{ver}")
+    log("网络探针 " + _get("https://ipsuper.com/"))
+    log("网络探针 " + _get("https://ipsuper.com/_nuxt/Dwx16dn2.js"))
+    log("网络探针 " + _get("https://api.ipsuper.com/endpoint", method="POST", data=b"{}"))
+
+
 def selftest_ipsuper():
     global IPSUPER_ENABLE
     if not (IPSUPER_ENABLE and ipsuper):
@@ -654,6 +679,7 @@ def main():
         f"IPPure 兜底={'开' if IPPURE_FALLBACK else '关'}")
     log(f"代码指纹 {code_fingerprint()}（daemon.py + ipsuper.py）")
     time.sleep(90)  # 等 resin + nginx 起来
+    netcheck()
     selftest_ipsuper()
     while True:
         try:
