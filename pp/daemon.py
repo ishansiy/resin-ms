@@ -147,13 +147,36 @@ def fetch_nodes():
     return data.get("items") or []
 
 
+def cache_record_valid(rec):
+    """只认字段看得住的结果，历史上 --dump-dom 写进去的外壳垃圾一律丢弃。"""
+    if not isinstance(rec, dict):
+        return False
+    if not rec.get("cc") or len(str(rec.get("cc"))) != 2:
+        return False
+    if not re.match(r"^AS\d{1,10}$", str(rec.get("asn") or "")):
+        return False
+    votes = rec.get("type_votes") or []
+    if not votes or all(str(v).strip("~ ") == "" for v in votes):
+        return False
+    return True
+
+
 def load_cache():
     path = os.path.join(STATE_DIR, "cache.json")
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
     except Exception:
         return {}
+    cache, dropped = {}, 0
+    for ip, rec in raw.items():
+        if cache_record_valid(rec):
+            cache[ip] = rec
+        else:
+            dropped += 1
+    if dropped:
+        log(f"缓存清理：丢弃 {dropped} 条无效记录（无国家/ASN 不合规/使用类型为空）")
+    return cache
 
 
 def save_cache(cache):
