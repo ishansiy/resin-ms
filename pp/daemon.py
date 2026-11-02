@@ -680,10 +680,8 @@ def selftest_ipsuper():
         return
     # 参数对照：找出在 Alpine Chromium 下能真正拿到数据的那一组
     variants = (
-        ("基线", {}),
-        ("正常UA", {"extra_args": [f"--user-agent={ipsuper.NORMAL_UA}"]}),
-        ("正常UA+中文", {"extra_args": [f"--user-agent={ipsuper.NORMAL_UA}", "--lang=zh-CN"]}),
-        ("关图+正常UA", {"extra_args": [f"--user-agent={ipsuper.NORMAL_UA}"]}),
+        ("CDP", {}),
+        ("dump-dom", {"use_cdp": False}),
     )
     for tag, kw in variants:
         try:
@@ -693,8 +691,8 @@ def selftest_ipsuper():
             continue
         log(
             f"自检[{tag}] ok={r.get('ok')} safe={r.get('safe_score')} cc={r.get('cc')} "
-            f"asn={r.get('asn')} votes={(r.get('type_votes') or [])[:3]} dom_len={r.get('dom_len')} "
-            f"err={r.get('error')}"
+            f"asn={r.get('asn')} votes={(r.get('type_votes') or [])[:3]} via={r.get('via')} "
+            f"err={r.get('error')} cdp_err={r.get('cdp_error')}"
         )
     try:
         rec = ipsuper.probe("8.8.8.8", timeout=IPSUPER_TIMEOUT)

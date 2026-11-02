@@ -238,18 +238,31 @@ def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000, extra_args=None):
         shutil.rmtree(profile, ignore_errors=True)
 
 
-def probe(ip, timeout=60, chrome=None, budget_ms=11000, extra_args=None):
-    """查询单个 IP；异常时返回 ok=False 且带 error。"""
+def probe(ip, timeout=60, chrome=None, budget_ms=11000, extra_args=None, use_cdp=True):
+    """查询单个 IP：优先 CDP 等数据渲染，失败再退回 --dump-dom；异常返回 ok=False。"""
+    if use_cdp:
+        try:
+            dom = fetch_cdp(ip, timeout=max(timeout, 90), chrome=chrome,
+                            extra_args=extra_args, data_wait=max(20, timeout // 2))
+            res = parse(ip, dom)
+            if res.get("ok"):
+                res["via"] = "cdp"
+                return res
+            probe.last_cdp_error = res.get("error")
+        except Exception as exc:  # noqa: BLE001
+            probe.last_cdp_error = f"{type(exc).__name__}: {str(exc)[:120]}"
     try:
         dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms,
                     extra_args=extra_args)
         res = parse(ip, dom)
-        if not res.get("ok") or (res.get("safe_score") or 0) >= 99:
+        if not res.get("ok"):
             lines = _strip_dom(dom)
             probe_text = " / ".join(lines[:60])[:400]
             res.setdefault("dom_excerpt", probe_text)
             res["dom_len"] = len(dom)
             res["stderr"] = getattr(fetch, "last_stderr", "")[:200]
+            if getattr(probe, "last_cdp_error", None):
+                res["cdp_error"] = probe.last_cdp_error
             res["diag"] = getattr(fetch, "last_diag", "")
         return res
     except Exception as exc:  # noqa: BLE001
@@ -262,3 +275,311 @@ if __name__ == "__main__":
 
     target = sys.argv[1] if len(sys.argv) > 1 else "35.78.68.207"
     print(json.dumps(probe(target), ensure_ascii=False, indent=2))
+
+
+class ProxyShim:
+    """本地 CONNECT 转发：给浏览器一个带 Proxy-Authorization 的 HTTP 代理。
+
+    Resin 的 2260 是正向代理，鉴权走 `Platform.Account:TOKEN` 的 Basic 头；
+    Chrome 不接受 `--proxy-server` 里内联凭据，所以这里做一层本地转发补头。
+    """
+
+    def __init__(self, upstream="127.0.0.1", upstream_port=2260, auth="", port=0):
+        import base64
+        import socket
+        import threading
+
+        self.upstream = upstream
+        self.upstream_port = upstream_port
+        self.auth = "Basic " + base64.b64encode(auth.encode()).decode()
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(128)
+        self.port = self.sock.getsockname()[1]
+        self._stop = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        import socket
+        import threading
+
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        import socket
+        try:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            first = head.split(b"\r\n", 1)[0].decode("latin-1")
+            parts = first.split()
+            if len(parts) < 2:
+                return
+            method, target = parts[0], parts[1]
+            up = socket.create_connection((self.upstream, self.upstream_port), timeout=20)
+            if method.upper() == "CONNECT":
+                req = (f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                       f"Proxy-Authorization: {self.auth}\r\n\r\n")
+                up.sendall(req.encode())
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = up.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                code = resp.split(b" ")[1] if b" " in resp else b"??"
+                if not code.startswith(b"2"):
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    return
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                rest = resp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in resp else b""
+                if rest:
+                    conn.sendall(rest)
+            else:
+                headers = [h for h in head.split(b"\r\n") if h and not h.lower().startswith(b"proxy-")]
+                up.sendall(b"\r\n".join(headers) + b"\r\nProxy-Authorization: " + self.auth.encode() + b"\r\n\r\n")
+            self._pipe(conn, up)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _pipe(a, b):
+        import select
+        import socket
+        try:
+            while True:
+                r, _, _ = select.select([a, b], [], [], 60)
+                if not r:
+                    break
+                for s in r:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (b if s is a else a).sendall(data)
+        finally:
+            for s in (a, b):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# ---------------- CDP 渲染（推荐路径） ----------------
+# --dump-dom + --virtual-time-budget 在部分 Chromium 版本上会在 XHR 返回前就落盘，
+# 拿到的是 SSR 外壳（数值全是 "~"）。这里直接用 CDP：导航后轮询页面文本，
+# 真正出数再取 outerHTML，超时才算失败。
+
+def _ws_handshake(sock, host, path):
+    import base64
+    import os as _os
+    key = base64.b64encode(_os.urandom(16)).decode()
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+           f"Sec-WebSocket-Version: 13\r\n\r\n")
+    sock.sendall(req.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("WebSocket 握手断开")
+        buf += chunk
+    if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+        line0 = buf.split(b"\r\n", 1)[0]
+        raise RuntimeError("WebSocket 握手失败：" + repr(line0[:80]))
+
+
+def _ws_send(sock, text):
+    import os as _os
+    import struct
+    data = text.encode()
+    header = bytearray([0x81])
+    n = len(data)
+    if n < 126:
+        header.append(0x80 | n)
+    elif n < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", n)
+    mask = _os.urandom(4)
+    header += mask
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    sock.sendall(bytes(header) + masked)
+
+
+def _ws_recv(sock, timeout=60):
+    import struct
+    sock.settimeout(timeout)
+    payload = b""
+    while True:
+        head = b""
+        while len(head) < 2:
+            chunk = sock.recv(2 - len(head))
+            if not chunk:
+                raise RuntimeError("WebSocket 关闭")
+            head += chunk
+        opcode = head[0] & 0x0F
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", sock.recv(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", sock.recv(8))[0]
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                raise RuntimeError("WebSocket 数据截断")
+            data += chunk
+        if opcode == 0x8:
+            raise RuntimeError("WebSocket 主动关闭")
+        if opcode in (0x9, 0xA):
+            continue
+        payload += data
+        if head[0] & 0x80:
+            return payload.decode("utf-8", "replace")
+
+
+class _CDP:
+    def __init__(self, ws_url, timeout=60):
+        import socket as _sock
+        import urllib.parse as _up
+        u = _up.urlparse(ws_url)
+        self.sock = _sock.create_connection((u.hostname, u.port), timeout=timeout)
+        _ws_handshake(self.sock, f"{u.hostname}:{u.port}", u.path or "/")
+        self.seq = 0
+
+    def call(self, method, params=None, timeout=60):
+        import json as _json
+        self.seq += 1
+        mid = self.seq
+        _ws_send(self.sock, _json.dumps({"id": mid, "method": method, "params": params or {}}))
+        while True:
+            msg = _json.loads(_ws_recv(self.sock, timeout=timeout))
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"CDP {method} 失败：{msg['error']}")
+                return msg.get("result") or {}
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _devtools_port(profile, deadline):
+    import os as _os
+    import time as _time
+    path = _os.path.join(profile, "DevToolsActivePort")
+    while _time.time() < deadline:
+        if _os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return int(f.readline().strip())
+            except (OSError, ValueError):
+                pass
+        _time.sleep(0.2)
+    return None
+
+
+def fetch_cdp(ip, timeout=90, chrome=None, extra_args=None, data_wait=35):
+    """用 CDP 打开页面，等数据真正渲染出来再取 outerHTML。"""
+    import json as _json
+    import subprocess
+    import time as _time
+    import urllib.request
+
+    bin_path = chrome or chrome_bin()
+    if not bin_path:
+        raise RuntimeError("找不到 chrome/chromium 可执行文件")
+    profile = tempfile.mkdtemp(prefix="ipsupercdp-")
+    url = f"https://ipsuper.com/?ip={ip}"
+    args = [
+        bin_path, "--headless=new", "--disable-gpu", "--no-sandbox",
+        "--disable-dev-shm-usage", "--no-first-run", "--disable-extensions",
+        "--disable-sync", "--mute-audio", "--hide-scrollbars",
+        "--remote-debugging-port=0", f"--user-data-dir={profile}", url,
+    ]
+    if extra_args:
+        args[1:1] = list(extra_args)
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = _time.time() + min(timeout, 30)
+        port = _devtools_port(profile, deadline)
+        if not port:
+            raise RuntimeError("DevTools 端口未就绪")
+        targets = []
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as r:
+                    targets = _json.loads(r.read().decode("utf-8", "replace"))
+                targets = [t for t in targets if t.get("type") == "page"]
+                if targets:
+                    break
+            except Exception:
+                pass
+            _time.sleep(0.2)
+        if not targets:
+            raise RuntimeError("没有可用的页面目标")
+        cdp = _CDP(targets[0]["webSocketDebuggerUrl"], timeout=timeout)
+        try:
+            end = _time.time() + data_wait
+            ready = False
+            while _time.time() < end:
+                res = cdp.call(
+                    "Runtime.evaluate",
+                    {"expression": "(() => { const t = document.body ? document.body.innerText : '';"
+                                   "return JSON.stringify({n: t.length, has: t.indexOf('综合安全分') >= 0,"
+                                   "ph: (t.match(/~/g) || []).length});})()",
+                     "returnByValue": True},
+                    timeout=15,
+                )
+                raw = (res.get("result") or {}).get("value") or "{}"
+                st = _json.loads(raw)
+                if st.get("has") and st.get("ph", 1) == 0 and st.get("n", 0) > 800:
+                    ready = True
+                    break
+                _time.sleep(0.7)
+            if not ready:
+                raise RuntimeError("等待数据超时（页面仍为占位符）")
+            res = cdp.call(
+                "Runtime.evaluate",
+                {"expression": "document.documentElement.outerHTML", "returnByValue": True},
+                timeout=30,
+            )
+            dom = (res.get("result") or {}).get("value") or ""
+            if len(dom) < 2000:
+                raise RuntimeError(f"DOM 过短 len={len(dom)}")
+            return dom
+        finally:
+            cdp.close()
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        shutil.rmtree(profile, ignore_errors=True)
