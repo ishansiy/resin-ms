@@ -82,6 +82,7 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
 `PP_INTERVAL`（秒，默认 10800）、`PP_CACHE_TTL`（默认 86400）、`PP_PROBE_MAX`（单轮上限，默认 420）、
 `PP_IPSUPER`（默认 1，设 0 关闭 ipsuper 只用 IPPure）、`PP_BROWSER_WORKERS`（浏览器并发，默认 3）、
 `PP_IPSUPER_TIMEOUT`（单 IP 渲染超时秒，默认 90）、`PP_IPPURE_FALLBACK`（默认 1）、
+`PP_REPROBE_FOREIGN`（默认 1：非 ipsuper 来源的旧缓存一律重测，用于数据源迁移）、
 `PP_WORKERS`（IPPure 兜底并发，默认 10）。
 
 用法示例：走日本节点 → `https://<域名>/<代理令牌>/日本/https/api.ipify.org?format=json`。

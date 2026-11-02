@@ -47,6 +47,7 @@ BROWSER_WORKERS = int(os.environ.get("PP_BROWSER_WORKERS", "3"))   # ipsuper 无
 IPSUPER_TIMEOUT = int(os.environ.get("PP_IPSUPER_TIMEOUT", "90"))  # 单个 IP 渲染超时
 IPSUPER_ENABLE = os.environ.get("PP_IPSUPER", "1") != "0" and ipsuper is not None
 IPPURE_FALLBACK = os.environ.get("PP_IPPURE_FALLBACK", "1") != "0"
+REPROBE_FOREIGN = os.environ.get("PP_REPROBE_FOREIGN", "1") != "0"  # 非 ipsuper 来源的旧缓存当过期，一次性迁移
 EGRESS_PROBE_MAX = int(os.environ.get("PP_EGRESS_PROBE_MAX", "25"))
 IPPURE_URL = "https://my.ippure.com/v1/info"
 TIER_PURE_MAX = 20
@@ -536,6 +537,19 @@ def nudge_egress(nodes):
         log(f"已对 {len(todo)} 个缺出口 IP 的节点触发探测")
 
 
+def cache_stale(rec, now):
+    """判断某条缓存是否该重测。"""
+    if not isinstance(rec, dict):
+        return True
+    ts = int(rec.get("ts") or 0)
+    if now - ts > CACHE_TTL:
+        return True
+    # 数据源迁移：老 ippure 条目在 ipsuper 可用时一律重测，避免两套评分混用
+    if IPSUPER_ENABLE and REPROBE_FOREIGN and rec.get("source") != "ipsuper":
+        return True
+    return False
+
+
 def cycle():
     nodes = fetch_nodes()
     if not nodes:
@@ -544,9 +558,7 @@ def cycle():
     cache = load_cache()
     now = int(time.time())
     targets = {n["egress_ip"] for n in nodes
-               if n.get("egress_ip") and (
-                   n["egress_ip"] not in cache
-                   or now - int(cache[n["egress_ip"]].get("ts", 0)) > CACHE_TTL)}
+               if n.get("egress_ip") and cache_stale(cache.get(n["egress_ip"]), now)}
     log(f"节点 {len(nodes)} 个，待测出口 IP {len(targets)} 个（缓存 {len(cache)} 条）")
     hits = collect(cache, targets)
     save_cache(cache)
