@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""IPSuper（https://ipsuper.com/?ip=<ip>）取数与解析。
+
+背景：ipsuper 没有公开 REST 接口，前端用加密签名协议打
+`POST https://api.ipsuper.com/endpoint`（头 xpa/xpq/xpw/xrd + 二进制 body），
+无法用纯 HTTP 复刻。这里改用无头 Chrome 渲染页面、从 DOM 文本里解析字段。
+
+与旧数据源 ippure 的差异（重要）：
+- ippure 只能查「请求方自己的 IP」，必须把请求从每个节点代理出去；
+- ipsuper 支持按任意 IP 查询，所以只要知道节点出口 IP 即可，无需代理绕行。
+- ippure 给的是 fraudScore（越大越危险）；ipsuper 给的是「综合安全分」（越大越好）。
+  本模块统一输出 risk = 100 - safe_score，保持下游语义不变。
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+CHROME_CANDIDATES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+
+# 中文国家名 → ISO 代码（与 daemon.COUNTRY_ZH 互为反向）
+COUNTRY_ISO = {
+    "日本": "JP", "美国": "US", "香港": "HK", "台湾": "TW", "新加坡": "SG", "韩国": "KR",
+    "德国": "DE", "法国": "FR", "荷兰": "NL", "英国": "GB", "西班牙": "ES", "波兰": "PL",
+    "捷克": "CZ", "瑞典": "SE", "芬兰": "FI", "爱沙尼亚": "EE", "拉脱维亚": "LV",
+    "立陶宛": "LT", "罗马尼亚": "RO", "保加利亚": "BG", "意大利": "IT", "爱尔兰": "IE",
+    "奥地利": "AT", "瑞士": "CH", "比利时": "BE", "丹麦": "DK", "挪威": "NO",
+    "葡萄牙": "PT", "希腊": "GR", "匈牙利": "HU", "斯洛伐克": "SK", "斯洛文尼亚": "SI",
+    "克罗地亚": "HR", "塞尔维亚": "RS", "乌克兰": "UA", "俄罗斯": "RU", "土耳其": "TR",
+    "以色列": "IL", "阿联酋": "AE", "沙特阿拉伯": "SA", "卡塔尔": "QA", "科威特": "KW",
+    "巴林": "BH", "阿曼": "OM", "约旦": "JO", "黎巴嫩": "LB", "伊朗": "IR", "伊拉克": "IQ",
+    "印度": "IN", "巴基斯坦": "PK", "孟加拉": "BD", "斯里兰卡": "LK", "尼泊尔": "NP",
+    "印尼": "ID", "马来西亚": "MY", "泰国": "TH", "越南": "VN", "菲律宾": "PH",
+    "柬埔寨": "KH", "缅甸": "MM", "老挝": "LA", "文莱": "BN", "蒙古": "MN",
+    "哈萨克斯坦": "KZ", "乌兹别克斯坦": "UZ", "吉尔吉斯斯坦": "KG", "塔吉克斯坦": "TJ",
+    "土库曼斯坦": "TM", "阿塞拜疆": "AZ", "亚美尼亚": "AM", "格鲁吉亚": "GE",
+    "澳大利亚": "AU", "新西兰": "NZ", "加拿大": "CA", "墨西哥": "MX", "巴西": "BR",
+    "阿根廷": "AR", "智利": "CL", "哥伦比亚": "CO", "秘鲁": "PE", "委内瑞拉": "VE",
+    "厄瓜多尔": "EC", "玻利维亚": "BO", "巴拉圭": "PY", "乌拉圭": "UY", "圭亚那": "GY",
+    "南非": "ZA", "埃及": "EG", "摩洛哥": "MA", "阿尔及利亚": "DZ", "突尼斯": "TN",
+    "利比亚": "LY", "尼日利亚": "NG", "肯尼亚": "KE", "加纳": "GH", "埃塞俄比亚": "ET",
+    "坦桑尼亚": "TZ", "乌干达": "UG", "塞内加尔": "SN", "科特迪瓦": "CI", "喀麦隆": "CM",
+    "津巴布韦": "ZW", "赞比亚": "ZM", "莫桑比克": "MZ", "安哥拉": "AO", "博茨瓦纳": "BW",
+    "纳米比亚": "NA", "毛里求斯": "MU", "中国": "CN", "澳门": "MO",
+}
+
+# 常见别名/全称 → ISO（ipsuper 的位置字段用中文全称）
+COUNTRY_ALIAS = {
+    "印度尼西亚": "ID", "阿拉伯联合酋长国": "AE", "大韩民国": "KR", "韩国": "KR",
+    "俄罗斯联邦": "RU", "美利坚合众国": "US", "中国香港": "HK", "中国台湾": "TW",
+    "中国澳门": "MO", "捷克共和国": "CZ", "越南社会主义共和国": "VN",
+    "伊朗伊斯兰共和国": "IR", "土耳其共和国": "TR", "泰王国": "TH",
+    "马来西亚联邦": "MY", "菲律宾共和国": "PH", "新加坡共和国": "SG",
+    "大不列颠及北爱尔兰联合王国": "GB", "英格兰": "GB", "苏格兰": "GB",
+    "荷兰王国": "NL", "德意志联邦共和国": "DE", "法兰西共和国": "FR",
+}
+
+RESIDENTIAL_WORDS = ("家宽", "住宅", "宽带", "移动网络", "移动")
+IDC_WORDS = ("机房", "数据中心", "IDC", "云服务器", "托管")
+
+
+def chrome_bin():
+    for name in CHROME_CANDIDATES:
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def _strip_dom(html):
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<[^>]+>", "\n", html)
+    html = html.replace("&nbsp;", " ").replace("&amp;", "&")
+    lines = [x.strip() for x in html.split("\n")]
+    return [x for x in lines if x]
+
+
+def _num(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _after(lines, label, offset=1):
+    """返回 label 之后第 offset 行；找不到返回 None。"""
+    for i, line in enumerate(lines):
+        if line == label and i + offset < len(lines):
+            return lines[i + offset]
+    return None
+
+
+def parse(ip, html):
+    """从渲染后的 DOM 中解析字段。返回 dict；解析失败 ok=False。"""
+    lines = _strip_dom(html)
+    text = " ".join(lines)
+    out = {"ip": ip, "ok": False, "source": "ipsuper"}
+
+    safe = grade = None
+    if "越大越好" in lines:
+        i = lines.index("越大越好")
+        safe = _num(lines[i + 1]) if i + 1 < len(lines) else None
+        if i + 4 < len(lines) and lines[i + 3] == "100":
+            grade = lines[i + 4]
+    if safe is None:
+        m = re.search(r"综合安全分\s*(\d{1,3})\s*/\s*100", text)
+        if m:
+            safe = _num(m.group(1))
+    if safe is None:
+        return out
+
+    out["safe_score"] = safe
+    out["risk"] = max(0.0, min(100.0, 100.0 - safe))
+    out["grade"] = grade
+
+    threats = _after(lines, "威胁数目")
+    kinds = _after(lines, "威胁种类")
+    out["threats"] = int(_num(threats) or 0)
+    out["threat_kinds"] = int(_num(kinds) or 0)
+
+    out["location"] = _after(lines, "位置")
+    iptype = _after(lines, "IP类型")
+    out["ip_type"] = iptype
+    usage = None
+    if iptype:
+        idx = lines.index(iptype)
+        if idx + 1 < len(lines):
+            usage = lines[idx + 1]
+    out["usage_kind"] = usage
+
+    asn_parts = []
+    for i, line in enumerate(lines):
+        if line == "ASN" and i + 1 < len(lines) and lines[i + 1].startswith("AS"):
+            j = i + 1
+            while j < len(lines) and lines[j] not in ("ASN", "流量", "网络构成比例（运营商业务范围）"):
+                asn_parts.append(lines[j])
+                j += 1
+            break
+    if asn_parts:
+        out["asn"] = asn_parts[0].replace(" ", "")
+        out["asn_org"] = " ".join(asn_parts[1:]).strip(" -()")
+
+    m = re.search(r"人类流量\s*([\d.]+)%", text)
+    out["human_pct"] = _num(m.group(1)) if m else None
+    m = re.search(r"机器流量\s*([\d.]+)%", text)
+    out["bot_pct"] = _num(m.group(1)) if m else None
+
+    m = re.search(r"家宽网络\s*([\d.]+)%", text)
+    out["home_net_pct"] = _num(m.group(1)) if m else None
+    m = re.search(r"数据中心\s*([\d.]+)%", text)
+    out["idc_net_pct"] = _num(m.group(1)) if m else None
+
+    # 「使用类型」一行：按顺序给出各库判定（机房/家宽/移动…）
+    votes = []
+    if "使用类型" in lines:
+        i = lines.index("使用类型") + 1
+        stop = ("公司类型", "多源IP风险", "风险评分", "风险因子")
+        while i < len(lines) and lines[i] not in stop:
+            votes.append(lines[i])
+            i += 1
+    out["type_votes"] = votes
+    out["res_votes"] = sum(1 for v in votes if any(w in v for w in RESIDENTIAL_WORDS))
+    out["idc_votes"] = sum(1 for v in votes if any(w in v for w in IDC_WORDS))
+
+    risks = [float(x) for x in re.findall(r"\b风险\s*([\d.]+)%", text)]
+    if risks:
+        out["max_risk"] = max(risks)
+        labels = re.findall(r"风险\s*[\d.]+%\s*([\u4e00-\u9fa5]{2,4}风险|[\u4e00-\u9fa5]{2,4})", text)
+        out["risk_labels"] = sorted(set(labels))[:8]
+
+    cc = None
+    if out["location"]:
+        country = out["location"].split(",")[0].strip()
+        cc = COUNTRY_ISO.get(country) or COUNTRY_ALIAS.get(country)
+        if not cc:  # 兜底：全称里含已知国名（如「印度尼西亚共和国」）
+            for name, iso in COUNTRY_ISO.items():
+                if len(name) >= 2 and name in country:
+                    cc = iso
+                    break
+    out["cc"] = cc
+    out["ok"] = True
+    return out
+
+
+def fetch(ip, timeout=60, chrome=None, extra_wait_ms=11000):
+    """渲染 ipsuper 页面并返回原始 DOM。失败抛异常。"""
+    bin_path = chrome or chrome_bin()
+    if not bin_path:
+        raise RuntimeError("找不到 chrome/chromium 可执行文件")
+    profile = tempfile.mkdtemp(prefix="ipsuper-")
+    args = [
+        bin_path, "--headless=new", "--disable-gpu", "--no-sandbox",
+        "--disable-dev-shm-usage", "--no-first-run", "--disable-extensions",
+        "--disable-background-networking", "--disable-sync", "--mute-audio",
+        "--hide-scrollbars", "--blink-settings=imagesEnabled=false",
+        f"--user-data-dir={profile}",
+        f"--virtual-time-budget={extra_wait_ms}", "--dump-dom",
+        f"https://ipsuper.com/?ip={ip}",
+    ]
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout)
+        dom = r.stdout.decode("utf-8", "replace")
+        if not dom or len(dom) < 2000:
+            raise RuntimeError(f"DOM 为空或过短 len={len(dom)}")
+        return dom
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def probe(ip, timeout=60, chrome=None, budget_ms=11000):
+    """查询单个 IP；异常时返回 ok=False 且带 error。"""
+    try:
+        dom = fetch(ip, timeout=timeout, chrome=chrome, extra_wait_ms=budget_ms)
+        res = parse(ip, dom)
+        if not res.get("ok"):
+            res["error"] = "parse_failed"
+        return res
+    except Exception as exc:  # noqa: BLE001
+        return {"ip": ip, "ok": False, "source": "ipsuper", "error": str(exc)[:200]}
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    target = sys.argv[1] if len(sys.argv) > 1 else "35.78.68.207"
+    print(json.dumps(probe(target), ensure_ascii=False, indent=2))

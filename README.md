@@ -48,30 +48,41 @@ curl -c jar https://resin.007666.xyz/t/<管理令牌>  # 浏览器：写 cookie 
 上游 README 里的 `./`（不指定平台）占位段在 ms.fun 边缘/CF Worker 的 URL 规范化下会被吞掉，
 表现为 `400 Failed to parse request URL`。
 
-## IPPure 纯净度守护（内置后台任务）
+## IP 纯净度守护（内置后台任务）
 
 镜像里带一个常驻脚本 `/opt/resin-pp/daemon.py`，由 `start.sh` 拉起，默认**每 3 小时**跑一轮：
 
-1. **采集**：读本地节点表，对每个出口 IP 经 Resin 自己的反代入口（不同 account 名 → 落到不同节点）请求
-   `https://my.ippure.com/v1/info`，拿到该出口的 `fraudScore`（风险系数，越低越纯净）、
-   `isResidential`（是否原生/住宅）、`countryCode`。并发 10，单轮上限 420 次探测。
-2. **缓存**：结果按 IP 落盘到持久盘 `/mnt/workspace/resin-data/purity/cache.json`，TTL 24 小时；
-   `summary.json` 记录每轮评估数、平均风险系数、原生数量。
-3. **自动分组**：按结果幂等维护 Resin platforms（平台名用中文；连续两轮无节点的托管平台会自动清理，用户手建的不动）：
+1. **采集（主源 ipsuper）**：读本地节点表拿到每个节点的出口 IP，直接用无头 chromium 渲染
+   `https://ipsuper.com/?ip=<出口IP>` 并解析结果 —— 综合安全分、机房/家宽、国家、ASN、
+   人类流量占比、多家数据库的使用类型投票。
+   因为 ipsuper 支持**按任意 IP 查询**，不需要把请求从节点代理出去。
+   ⚠️ ipsuper 没有公开 REST 接口（前端打 `POST https://api.ipsuper.com/endpoint`，带
+   `xpa/xpq/xpw/xrd` 签名头和二进制加密 body），所以只能走渲染解析。
+2. **采集（兜底 IPPure）**：ipsuper 查不到的 IP，回退旧通道 —— 经 Resin 反代轮询节点出口，
+   请求 `https://my.ippure.com/v1/info` 拿 `fraudScore`。
+3. **缓存**：结果按 IP 落盘到持久盘 `/mnt/workspace/resin-data/purity/cache.json`，TTL 24 小时；
+   `summary.json` 记录每轮评估数、平均风险分、住宅数、各数据源条数。
+4. **自动分组**：按结果幂等维护 Resin platforms（平台名用中文；连续两轮无节点的托管平台会自动清理，用户手建的不动）：
 
 | 平台 | 含义 | 依据 |
 |---|---|---|
-| `<中文国名>` | 按国家，如 `日本`、`美国`、`香港` | `region_filters=[cc]`（小写 ISO 两字母） |
-| `住宅IP` | 原生/住宅 IP | tag 精确匹配 |
-| `纯净` | 风险系数 ≤ 20 | 同上 |
+| `<中文国名>` | 按国家，如 `日本`、`美国`、`香港` | `region_filters=[cc]`（小写 ISO 两字母）+ 精确 tag 白名单 |
+| `住宅IP` | 家宽/住宅/移动出口 | ipsuper 使用类型判定，或多源投票家宽占多数 |
+| `纯净` | 风险分 ≤ 20（综合安全分 ≥ 80） | tag 精确匹配 |
 | `良好` | 21 ~ 50 | 同上 |
 | `高风险` | > 50 | 同上 |
+| `CDN出口` | Cloudflare/Fastly/Akamai 等 Anycast 出口 | ASN + 网段判断，避免污染国家平台 |
+
+> 风险分 = `100 - 综合安全分`，与旧 ippure 的 `fraudScore` 语义对齐，阈值不用改。
 
 > 坑：Resin 的 tag 正则匹配的是**完整候选串 `<订阅名>/<节点名>`**（等于 `display_tag`），
 > 只写节点名匹配不到任何节点，平台会一直 503 `No available nodes for routing`。
 
-可用环境变量（在创空间里配 Variable 即可覆盖）：`PP_INTERVAL`（秒，默认 10800）、
-`PP_PROBE_MAX`（默认 420）、`PP_WORKERS`（默认 10）、`PP_CACHE_TTL`（默认 86400）。
+可用环境变量（在创空间里配 Variable 即可覆盖）：
+`PP_INTERVAL`（秒，默认 10800）、`PP_CACHE_TTL`（默认 86400）、`PP_PROBE_MAX`（单轮上限，默认 420）、
+`PP_IPSUPER`（默认 1，设 0 关闭 ipsuper 只用 IPPure）、`PP_BROWSER_WORKERS`（浏览器并发，默认 3）、
+`PP_IPSUPER_TIMEOUT`（单 IP 渲染超时秒，默认 90）、`PP_IPPURE_FALLBACK`（默认 1）、
+`PP_WORKERS`（IPPure 兜底并发，默认 10）。
 
 用法示例：走日本节点 → `https://<域名>/<代理令牌>/日本/https/api.ipify.org?format=json`。
 

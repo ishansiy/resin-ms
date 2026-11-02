@@ -143,18 +143,24 @@ log "nginx 已启动：对外 7860 → 面板 /ui/ ，API /api/ ，反代 /<令�
 ) &
 ROT_PID=$!
 
-# 后台 IPPure 纯净度守护：按国家/风险系数自动维护 platforms
+# 后台纯净度守护：ipsuper 按出口 IP 直查（主）+ IPPure 经反代（兜底）
 # 输出直接进容器日志（便于平台侧排查），状态落持久盘 $PERSIST_DIR/purity/
 PP_INTERVAL="${PP_INTERVAL:-10800}"
+PP_BROWSER_WORKERS="${PP_BROWSER_WORKERS:-3}"
+PP_IPSUPER="${PP_IPSUPER:-1}"
+PP_IPPURE_FALLBACK="${PP_IPPURE_FALLBACK:-1}"
 (
   PP_STATE_DIR="$PERSIST_DIR/purity" \
   PP_INTERVAL="$PP_INTERVAL" \
+  PP_BROWSER_WORKERS="$PP_BROWSER_WORKERS" \
+  PP_IPSUPER="$PP_IPSUPER" \
+  PP_IPPURE_FALLBACK="$PP_IPPURE_FALLBACK" \
   PP_PUBLIC_BASE="http://127.0.0.1:7860" \
   RESIN_LOCAL_API="http://127.0.0.1:${RESIN_PORT:-2260}" \
   exec python3 /opt/resin-pp/daemon.py
 ) &
 PP_PID=$!
-log "IPPure 守护已启动（每 ${PP_INTERVAL}s 一轮 → 自动维护 PP-<国家> 与 PP-{RESI,PURE,GOOD,RISKY} 平台）"
+log "纯净度守护已启动（数据源 ipsuper，无头 chromium 渲染解析；每 ${PP_INTERVAL}s 一轮，浏览器并发 ${PP_BROWSER_WORKERS} → 自动维护中文国家平台与 住宅IP/纯净/良好/高风险/CDN出口）"
 
 cleanup() {
   trap - TERM INT EXIT

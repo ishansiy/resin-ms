@@ -5,7 +5,7 @@ FROM ${BASE}
 
 USER root
 
-RUN apk add --no-cache nginx sqlite tzdata curl python3 \
+RUN apk add --no-cache nginx sqlite tzdata curl python3 chromium \
  && mkdir -p /run/nginx /etc/resin /usr/share/resin /opt/resin-pp \
             /var/lib/nginx/tmp /var/lib/nginx/client_body /var/lib/nginx/proxy \
             /var/lib/nginx/fastcgi /var/lib/nginx/scgi /var/lib/nginx/uwsgi \
@@ -15,7 +15,8 @@ COPY nginx.conf /etc/resin/nginx.conf
 COPY landing.html /usr/share/resin/index.html
 COPY start.sh /usr/local/bin/resin-start.sh
 COPY pp/daemon.py /opt/resin-pp/daemon.py
-RUN chmod +x /usr/local/bin/resin-start.sh && python3 -m py_compile /opt/resin-pp/daemon.py
+COPY pp/ipsuper.py /opt/resin-pp/ipsuper.py
+RUN chmod +x /usr/local/bin/resin-start.sh && python3 -m py_compile /opt/resin-pp/daemon.py /opt/resin-pp/ipsuper.py
 
 # Resin 只监听回环地址，公网一律经 nginx:7860
 ENV RESIN_LISTEN_ADDRESS=127.0.0.1 \

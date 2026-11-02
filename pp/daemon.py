@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""IPPure 纯净度守护进程（跑在创空间容器内，后台常驻）
+"""IP 纯净度守护进程（跑在创空间容器内，后台常驻）
 
 做三件事：
-  1. 采集：经 Resin 自己的反代入口，用不同 account 名轮询节点出口，
-     调用 https://my.ippure.com/v1/info 拿到「该出口 IP」的
-     fraudScore（风险系数，越低越纯净）、isResidential（是否原生/住宅）、countryCode。
+  1. 采集：以 ipsuper（https://ipsuper.com/?ip=<ip>，无头 Chrome 渲染解析）为主源，
+     按 Resin 给出的节点出口 IP 直接查「综合安全分 / 家宽或机房 / 国家 / ASN」，
+     不必把请求从节点代理出去；ipsuper 查不到的再回退旧通道：
+     经 Resin 反代轮询节点出口，调 https://my.ippure.com/v1/info 拿 fraudScore。
   2. 落盘：结果按 IP 缓存到持久盘（含 TTL），供排查与复用。
-  3. 分组：按国家 + IP 属性自动创建/维护 Resin platforms：
-        PP-<CC>     按国家（region_filters）
-        PP-RESI     原生/住宅 IP（按 tag 精确匹配）
-        PP-PURE     风险系数 <= 20
-        PP-GOOD     21 ~ 50
-        PP-RISKY    > 50
+  3. 分组：按国家 + IP 属性自动创建/维护 Resin platforms（中文名）：
+        <国家中文名>  按实测出口国家（region_filters + 精确 tag）
+        住宅IP        家宽/住宅/移动，或多源判定家宽占多数
+        纯净          风险分 <= 20（= 综合安全分 >= 80）
+        良好          21 ~ 50
+        高风险        > 50
+        CDN出口       Cloudflare/Fastly/Akamai 等 Anycast 出口
 
 只用标准库；任何异常都不影响主服务（失败只记日志，下个周期重试）。
 """
@@ -27,6 +29,11 @@ import urllib.parse
 import urllib.request
 from concurrent import futures
 
+try:
+    import ipsuper
+except Exception as _exc:  # 例如镜像里没装 chromium
+    ipsuper = None
+
 LOCAL_API = os.environ.get("RESIN_LOCAL_API", "http://127.0.0.1:2260")
 PUBLIC_BASE = os.environ.get("PP_PUBLIC_BASE", "http://127.0.0.1:7860")
 ADMIN = os.environ.get("RESIN_ADMIN_TOKEN", "")
@@ -35,7 +42,11 @@ STATE_DIR = os.environ.get("PP_STATE_DIR", "/mnt/workspace/resin-data/purity")
 INTERVAL = int(os.environ.get("PP_INTERVAL", "10800"))      # 3h
 CACHE_TTL = int(os.environ.get("PP_CACHE_TTL", "86400"))    # 24h
 PROBE_MAX = int(os.environ.get("PP_PROBE_MAX", "420"))      # 单轮最大探测请求数
-WORKERS = int(os.environ.get("PP_WORKERS", "10"))           # 探测并发度
+WORKERS = int(os.environ.get("PP_WORKERS", "10"))           # IPPure 兜底并发度
+BROWSER_WORKERS = int(os.environ.get("PP_BROWSER_WORKERS", "3"))   # ipsuper 无头浏览器并发度
+IPSUPER_TIMEOUT = int(os.environ.get("PP_IPSUPER_TIMEOUT", "90"))  # 单个 IP 渲染超时
+IPSUPER_ENABLE = os.environ.get("PP_IPSUPER", "1") != "0" and ipsuper is not None
+IPPURE_FALLBACK = os.environ.get("PP_IPPURE_FALLBACK", "1") != "0"
 EGRESS_PROBE_MAX = int(os.environ.get("PP_EGRESS_PROBE_MAX", "25"))
 IPPURE_URL = "https://my.ippure.com/v1/info"
 TIER_PURE_MAX = 20
@@ -153,8 +164,8 @@ def save_cache(cache):
     os.replace(tmp, path)
 
 
-def probe_one(account):
-    """经反代指定 account，落到某个节点，问 IPPure 这个出口的属性。"""
+def probe_via_resin(account):
+    """经反代指定 account，落到某个节点，问 IPPure 这个出口的属性（兜底通道）。"""
     url = f"{PUBLIC_BASE}/{urllib.parse.quote(PROXY)}/Default.{account}/https/my.ippure.com/v1/info"
     try:
         status, data = http(url, timeout=25)
@@ -170,36 +181,124 @@ def probe_one(account):
         "cc": (data.get("countryCode") or "").lower(),
         "asn": data.get("asn"),
         "org": data.get("asOrganization"),
+        "source": "ippure",
         "ts": int(time.time()),
     }, None
 
 
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_ipsuper(rec):
+    """把 ipsuper 的结果映射成守护内部统一格式。
+
+    score 统一为「风险分」= 100 - 综合安全分（越大越危险），保持与旧 ippure 语义一致，
+    这样 TIER_PURE_MAX/TIER_GOOD_MAX 阈值不用改。
+    """
+    risk = _as_float(rec.get("risk"))
+    if risk is None:
+        safe = _as_float(rec.get("safe_score"))
+        risk = None if safe is None else 100.0 - safe
+    votes_r = rec.get("res_votes") or 0
+    votes_i = rec.get("idc_votes") or 0
+    usage = rec.get("usage_kind") or ""
+    residential = (
+        ("家宽" in usage) or ("住宅" in usage) or ("移动" in usage)
+        or (votes_r >= 3 and votes_r > votes_i)
+    )
+    return {
+        "ip": rec.get("ip"),
+        "score": risk,
+        "safe_score": rec.get("safe_score"),
+        "grade": rec.get("grade"),
+        "residential": bool(residential),
+        "usage_kind": usage,
+        "res_votes": votes_r,
+        "idc_votes": votes_i,
+        "human_pct": rec.get("human_pct"),
+        "bot_pct": rec.get("bot_pct"),
+        "max_risk": rec.get("max_risk"),
+        "cc": (rec.get("cc") or "").lower(),
+        "asn": rec.get("asn"),
+        "org": rec.get("asn_org"),
+        "location": rec.get("location"),
+        "source": "ipsuper",
+        "ts": int(time.time()),
+    }
+
+
+def collect_ipsuper(cache, missing):
+    """用 ipsuper 按「出口 IP」直查：不必把请求从节点代理出去。"""
+    todo = sorted(missing)[:PROBE_MAX]
+    if not todo:
+        return 0, missing
+    log(f"ipsuper 待查 {len(todo)} 个出口 IP（并发 {BROWSER_WORKERS}）")
+    lock = threading.Lock()
+    hits = 0
+
+    def worker(ip):
+        nonlocal hits
+        rec = ipsuper.probe(ip, timeout=IPSUPER_TIMEOUT)
+        if not rec.get("ok"):
+            return
+        norm = normalize_ipsuper(rec)
+        if not norm.get("ip"):
+            return
+        with lock:
+            cache[norm["ip"]] = norm
+            hits += 1
+            missing.discard(norm["ip"])
+
+    with futures.ThreadPoolExecutor(max_workers=BROWSER_WORKERS) as pool:
+        list(pool.map(worker, todo))
+    return hits, missing
+
+
+def collect_ippure(cache, missing):
+    """兜底：并发轮询不同 account，直到覆盖剩余目标的出口 IP。"""
+    lock = threading.Lock()
+    hits = 0
+
+    def worker(idx):
+        nonlocal hits
+        with lock:
+            if not missing:
+                return
+        rec, err = probe_via_resin(f"pp{idx:04d}")
+        if err or not rec:
+            return
+        with lock:
+            if rec["ip"] in missing:
+                hits += 1
+                missing.discard(rec["ip"])
+            cache[rec["ip"]] = rec
+
+    with futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        list(pool.map(worker, range(1, PROBE_MAX + 1)))
+    return hits, missing
+
+
 def collect(cache, targets):
-    """并发轮询不同 account，直到覆盖目标的出口 IP 或达到次数上限。"""
+    """先用 ipsuper 按 IP 直查，剩余未覆盖的再用 IPPure 兜底。"""
     missing = set(targets)
     if not missing:
         return 0
     hits = 0
-    lock = threading.Lock()
-
-    def worker(idx):
-        nonlocal hits
-        if not missing:
-            return
-        rec, err = probe_one(f"pp{idx:04d}")
-        if err or not rec:
-            return
-        with lock:
-            hits += 1
-            cache[rec["ip"]] = rec
-            missing.discard(rec["ip"])
-
-    with futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        list(pool.map(worker, range(1, PROBE_MAX + 1)))
-
+    if IPSUPER_ENABLE:
+        got, missing = collect_ipsuper(cache, missing)
+        hits += got
+    if missing and IPPURE_FALLBACK:
+        log(f"ipsuper 未覆盖 {len(missing)} 个，回退 IPPure 探测")
+        got, missing = collect_ippure(cache, missing)
+        hits += got
     if missing:
         log(f"本轮未覆盖 {len(missing)} 个出口 IP（下轮继续）")
     return hits
+
 
 
 # ---------------- 分组 ----------------
@@ -458,9 +557,14 @@ def cycle():
     nums = [r["score"] for r in scored if isinstance(r.get("score"), (int, float))]
     avg = round(sum(nums) / len(nums), 1) if nums else None
     resi = sum(1 for r in scored if r.get("residential"))
+    src = {}
+    for r in scored:
+        key = r.get("source") or "ippure"
+        src[key] = src.get(key, 0) + 1
     if scored:
-        log(f"本轮探测 {hits} 次；已评估 {len(scored)} 节点，平均风险系数 {avg}，"
-            f"原生 {resi} 个；平台变更 {made} 个")
+        src_desc = "/".join(f"{k} {v}" for k, v in sorted(src.items()))
+        log(f"本轮探测 {hits} 次；已评估 {len(scored)} 节点（{src_desc}），"
+            f"平均风险分 {avg}（越低越干净），住宅/家宽 {resi} 个；平台变更 {made} 个")
     else:
         log(f"本轮探测 {hits} 次，尚无评估结果")
     nudge_egress(nodes)
@@ -470,6 +574,7 @@ def cycle():
         "evaluated": len(scored),
         "avg_score": avg,
         "residential": resi,
+        "sources": src,
         "platforms_changed": made,
     }
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -482,6 +587,8 @@ def main():
         log("缺少 RESIN_ADMIN_TOKEN / RESIN_PROXY_TOKEN，退出")
         return 1
     log(f"启动：每 {INTERVAL}s 一轮，缓存 TTL {CACHE_TTL}s，探测上限 {PROBE_MAX} 次/轮")
+    log(f"数据源：ipsuper={'开' if IPSUPER_ENABLE else '关'}（并发 {BROWSER_WORKERS}），"
+        f"IPPure 兜底={'开' if IPPURE_FALLBACK else '关'}")
     time.sleep(90)  # 等 resin + nginx 起来
     while True:
         try:
